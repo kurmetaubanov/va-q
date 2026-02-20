@@ -1,14 +1,9 @@
 """
 Voice Scheduling Agent
-- STT: Deepgram Streaming
-- LLM: Groq (llama-3.3-70b-versatile) + function calling
-- TTS: ElevenLabs mp3
+STT: Deepgram  |  LLM: Groq  |  TTS: ElevenLabs
 
-pip install groq fastapi uvicorn websockets icalendar httpx
-GROQ_API_KEY=...
-DEEPGRAM_API_KEY=...
-ELEVENLABS_API_KEY=...
-uvicorn main:app --reload
+pip install groq fastapi uvicorn websockets icalendar httpx python-dotenv
+uvicorn app.main:app --reload
 """
 
 import asyncio
@@ -19,50 +14,48 @@ from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-
-load_dotenv()
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import FileResponse, HTMLResponse
 from groq import Groq
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
+load_dotenv()
 from .calendar_export import save_ics
 
-# ─────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # Config
-# ─────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 
 GROQ_API_KEY       = os.environ["GROQ_API_KEY"]
 DEEPGRAM_API_KEY   = os.environ["DEEPGRAM_API_KEY"]
 ELEVENLABS_API_KEY = os.environ["ELEVENLABS_API_KEY"]
-ELEVENLABS_VOICE   = os.environ.get("ELEVENLABS_VOICE_ID", "JBFqnCBsd6RMkjVDRZzb")  # default: George
-
-MODEL = "llama-3.3-70b-versatile"
-TTS_ENABLED = True  # set True to enable ElevenLabs TTS
+ELEVENLABS_VOICE   = os.environ["ELEVENLABS_VOICE_ID"]
+MODEL              = "llama-3.3-70b-versatile"
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# ─────────────────────────────────────────
-# State
-# ─────────────────────────────────────────
+DEEPGRAM_URL = (
+    "wss://api.deepgram.com/v1/listen"
+    "?model=nova-2&language=en-US&punctuate=true"
+    "&interim_results=true&endpointing=400"
+)
 
-def empty_state():
-    return {
-        "user_name": None,
-        "date": None,
-        "time": None,
-        "title": None,
-        "schedule_finalized": False,
-    }
+# ─────────────────────────────────────────────────────────────
+# Scheduling state
+# ─────────────────────────────────────────────────────────────
 
-app_state = {
-    "history": [],
-    "state": empty_state(),
-    "ics_path": None,
-    "iso_datetime": None,
-}
+def empty_state() -> dict:
+    return {"user_name": None, "date": None, "time": None,
+            "title": None, "schedule_finalized": False}
 
-def is_finalized(state):
+def merge_state(old: dict, updates: dict) -> dict:
+    new = old.copy()
+    for k in new:
+        if updates.get(k) is not None:
+            new[k] = updates[k]
+    return new
+
+def is_finalized(state: dict) -> bool:
     return bool(
         state.get("schedule_finalized")
         and state.get("user_name")
@@ -70,18 +63,9 @@ def is_finalized(state):
         and state.get("time")
     )
 
-def merge_state(old, updates):
-    if not updates:
-        return old
-    new = old.copy()
-    for k in new:
-        if k in updates and updates[k] is not None:
-            new[k] = updates[k]
-    return new
-
-# ─────────────────────────────────────────
-# Tools
-# ─────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Groq tools
+# ─────────────────────────────────────────────────────────────
 
 TOOLS = [
     {
@@ -174,11 +158,11 @@ TOOLS = [
     }
 ]
 
-# ─────────────────────────────────────────
-# System prompt
-# ─────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Pure sync functions — run via asyncio.to_thread, never block loop
+# ─────────────────────────────────────────────────────────────
 
-def build_system(state, secondary_intent=None):
+def _build_system(state: dict, secondary_intent: dict | None = None) -> str:
     today = datetime.now().strftime("%A, %Y-%m-%d")
 
     drift_instruction = ""
@@ -219,26 +203,50 @@ Rules:
 - Keep responses short and conversational.
 {drift_instruction}"""
 
-# ─────────────────────────────────────────
-# LLM dialogue step
-# ─────────────────────────────────────────
 
-def dialogue_step(history, state, user_msg):
+def groq_initiate() -> str:
+    """Opening greeting. Sync — run in thread pool."""
+    r = groq_client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a friendly scheduling assistant. "
+                    "Start the conversation. Ask for the user's name, "
+                    "preferred date and time, and optionally a meeting title. "
+                    "Be brief and natural. One or two sentences."
+                )
+            },
+            {"role": "user", "content": "__start__"}
+        ],
+        temperature=0.7,
+        max_tokens=128,
+    )
+    return r.choices[0].message.content.strip()
+
+
+def groq_dialogue(history: list, state: dict, user_msg: str) -> tuple[str, dict, str | None]:
+    """
+    One dialogue turn. Sync — run in thread pool.
+    Returns (reply_text, new_state, iso_datetime_or_None).
+    """
     messages = history + [{"role": "user", "content": user_msg}]
 
     response = groq_client.chat.completions.create(
         model=MODEL,
-        messages=[{"role": "system", "content": build_system(state)}] + messages,
+        messages=[{"role": "system", "content": _build_system(state)}] + messages,
         tools=TOOLS,
         tool_choice="auto",
         temperature=0.5,
         max_tokens=512,
     )
 
-    message = response.choices[0].message
-    reply_text = message.content or ""
-    new_state = state
+    message      = response.choices[0].message
+    reply_text   = message.content or ""
+    new_state    = state
     secondary_intent = None
+    iso_datetime = None
 
     if message.tool_calls:
         for tc in message.tool_calls:
@@ -258,8 +266,8 @@ def dialogue_step(history, state, user_msg):
                 print(f"[TOOL] flag_secondary_intent: {args}")
 
             elif name == "resolve_datetime":
-                app_state["iso_datetime"] = args.get("iso_datetime")
-                print(f"[TOOL] resolve_datetime: {args}")
+                iso_datetime = args.get("iso_datetime")
+                print(f"[TOOL] resolve_datetime: {iso_datetime}")
 
     if message.tool_calls and not reply_text:
         tool_results = [
@@ -269,7 +277,7 @@ def dialogue_step(history, state, user_msg):
         followup = groq_client.chat.completions.create(
             model=MODEL,
             messages=[
-                {"role": "system", "content": build_system(new_state, secondary_intent)},
+                {"role": "system", "content": _build_system(new_state, secondary_intent)},
                 *messages,
                 {"role": "assistant", "content": None, "tool_calls": message.tool_calls},
                 *tool_results,
@@ -279,357 +287,332 @@ def dialogue_step(history, state, user_msg):
         )
         reply_text = followup.choices[0].message.content or "Got it!"
 
-    return reply_text, new_state, is_finalized(new_state)
+    return reply_text, new_state, iso_datetime
 
-# ─────────────────────────────────────────
-# ElevenLabs TTS
-# ─────────────────────────────────────────
 
-async def text_to_speech(text: str) -> bytes:
+# ─────────────────────────────────────────────────────────────
+# Async TTS
+# ─────────────────────────────────────────────────────────────
+
+async def elevenlabs_tts(text: str) -> bytes:
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE}"
-    headers = {
-        "xi-api-key": ELEVENLABS_API_KEY,
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "text": text,
-        "model_id": "eleven_turbo_v2_5",
-        "voice_settings": {"stability": 0.4, "similarity_boost": 0.8},
-    }
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(url, headers=headers, json=payload)
-        r.raise_for_status()
-        return r.content  # mp3 bytes
-
-# ─────────────────────────────────────────
-# Initiator
-# ─────────────────────────────────────────
-
-def initiate_text() -> str:
-    response = groq_client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a friendly scheduling assistant. "
-                    "Start the conversation. Ask for the user's name, "
-                    "preferred date and time, and optionally a meeting title. "
-                    "Be brief and natural. One or two sentences."
-                )
+        r = await client.post(
+            url,
+            headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
+            json={
+                "text": text,
+                "model_id": "eleven_turbo_v2_5",
+                "voice_settings": {"stability": 0.4, "similarity_boost": 0.8},
             },
-            {"role": "user", "content": "__start__"}
-        ],
-        temperature=0.7,
-        max_tokens=128,
-    )
-    return response.choices[0].message.content.strip()
+        )
+        r.raise_for_status()
+        return r.content
 
-# ─────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────
 # FastAPI
-# ─────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 
 app = FastAPI()
 
-@app.get("/download-ics")
-def download_ics():
-    path = app_state.get("ics_path")
-    if not path or not Path(path).exists():
-        from fastapi import HTTPException
-        raise HTTPException(status_code=404, detail="No .ics file available yet")
-    return FileResponse(path, media_type="text/calendar", filename=Path(path).name)
+session = {
+    "history":      [],
+    "state":        empty_state(),
+    "iso_datetime": None,
+    "ics_path":     None,
+}
+
+
+@app.get("/")
+def index():
+    return HTMLResponse(INDEX_HTML)
+
 
 @app.get("/favicon.ico")
 def favicon():
-    icon_path = Path(__file__).with_name("favicon.ico")
-    return FileResponse(icon_path)
+    return FileResponse(Path(__file__).with_name("favicon.ico"))
+
+
+@app.get("/download-ics")
+def download_ics():
+    from fastapi import HTTPException
+    p = session.get("ics_path")
+    if not p or not Path(p).exists():
+        raise HTTPException(404, "No .ics file yet")
+    return FileResponse(p, media_type="text/calendar", filename=Path(p).name)
+
 
 @app.get("/debug")
 def debug():
-    return {k: v for k, v in app_state.items() if k != "history"}
+    return {k: v for k, v in session.items() if k != "history"}
 
-# ─────────────────────────────────────────
-# Main WebSocket — browser ↔ server
-# ─────────────────────────────────────────
 
-DEEPGRAM_WS_URL = (
-    "wss://api.deepgram.com/v1/listen"
-    "?model=nova-2"
-    "&language=en-US"
-    "&punctuate=true"
-    "&interim_results=true"
-    "&endpointing=400"
-)
+# ─────────────────────────────────────────────────────────────
+# WebSocket endpoint
+# ─────────────────────────────────────────────────────────────
 
 @app.websocket("/ws")
-async def ws_endpoint(ws: WebSocket):
-    """
-    One WebSocket per browser session.
-    Opens its own Deepgram connection — no global queues.
-    """
-    import websockets as ws_lib
+async def ws_endpoint(websocket: WebSocket):
+    import websockets as wsl
 
-    await ws.accept()
+    await websocket.accept()
 
-    # Per-session audio queue: browser → Deepgram
-    audio_q: asyncio.Queue = asyncio.Queue()
-    # Per-session transcript queue: Deepgram → LLM
+    audio_q:      asyncio.Queue = asyncio.Queue()
     transcript_q: asyncio.Queue = asyncio.Queue()
-    # Buffer accumulates partial transcripts while recording
-    transcript_buffer: list = []
-    is_recording: dict = {"active": False}
-    recording_ctx = {"id": 0, "started_at": None, "chunks": 0, "bytes": 0}
-    dg_ready = asyncio.Event()
+    rec_bufs:     dict          = {}   # rec_id -> [fragment, ...]
 
-    async def send_text(msg: str):
+    rec_id      = 0
+    rec_active  = False
+    rec_started = 0.0
+
+    dg_ready    = asyncio.Event()   # Deepgram connected and ready
+    dg_flushed  = asyncio.Event()   # Deepgram finished flushing finals after CloseStream
+
+    # ── send helpers ─────────────────────────────────────────
+
+    async def tx(msg: str):
         try:
-            if ws.client_state == WebSocketState.CONNECTED:
-                await ws.send_text(msg)
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.send_text(msg)
         except Exception:
             pass
 
-    async def send_debug(msg: str):
+    async def tx_debug(msg: str):
         print(msg)
-        await send_text(f"__debug__{msg}")
+        await tx(f"__debug__{msg}")
 
     async def speak(text: str):
-        if not TTS_ENABLED:
-            return
         try:
-            audio = await text_to_speech(text)
-            if ws.client_state == WebSocketState.CONNECTED:
-                await ws.send_bytes(audio)
+            mp3 = await elevenlabs_tts(text)
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.send_bytes(mp3)
         except Exception as e:
             print(f"[TTS ERROR] {e}")
 
-    async def process_transcript(transcript: str):
-        if not transcript.strip():
-            return
-        print(f"[TRANSCRIPT] {transcript}")
-        await send_text(f"__user__{transcript}")
-
-        history = app_state["history"]
-        state = app_state["state"]
-        reply, new_state, should_reset = dialogue_step(history, state, transcript)
-        print(f"[REPLY] {reply}")
-
-        new_history = history + [
-            {"role": "user", "content": transcript},
-            {"role": "assistant", "content": reply},
-        ]
-
-        await send_text(f"__agent__{reply}")
-
-        if should_reset:
-            try:
-                iso_dt = app_state.get("iso_datetime")
-                if not iso_dt:
-                    raise ValueError("iso_datetime not resolved")
-                ics_path = save_ics(new_state, iso_dt)
-                app_state["ics_path"] = str(ics_path)
-                await send_text("__ics_ready__")
-            except Exception as e:
-                print(f"[ICS ERROR] {e}")
-            app_state["history"] = []
-            app_state["state"] = empty_state()
-            app_state["iso_datetime"] = None
-            await speak(reply)
-            await send_text("__show_start__")
-        else:
-            app_state["history"] = new_history
-            app_state["state"] = new_state
-            await speak(reply)
+    # ── Deepgram background task ──────────────────────────────
 
     async def deepgram_task():
-        """
-        Persistent Deepgram connection for the entire browser session.
-        Sends KeepAlive every 5s to prevent timeout between recordings.
-        """
+        nonlocal rec_id
         while True:
             try:
-                async with ws_lib.connect(
-                    DEEPGRAM_WS_URL,
+                async with wsl.connect(
+                    DEEPGRAM_URL,
                     additional_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
-                    ping_interval=None,  # disable websockets ping, we use DG KeepAlive
+                    ping_interval=None,
                 ) as dg:
-                    print("[DEEPGRAM] session connected")
+                    print("[DG] connected")
                     dg_ready.set()
+                    dg_flushed.set()   # no pending flush at start
 
-                    async def dg_sender():
+                    async def sender():
                         while True:
                             try:
                                 item = await asyncio.wait_for(audio_q.get(), timeout=5.0)
-                                if item is None:
-                                    break
-                                if isinstance(item, dict):
-                                    if item.get("type") == "finalize":
-                                        await dg.send(json.dumps({"type": "Finalize"}))
-                                        print("[Q→DG] Finalize sent to Deepgram")
-                                        continue
-                                    if item.get("type") == "close_stream":
-                                        await dg.send(json.dumps({"type": "CloseStream"}))
-                                        print("[Q→DG] CloseStream sent to Deepgram")
-                                        await dg.close(code=1000)
-                                        print("[Q→DG] local Deepgram socket close requested")
-                                        break
-
-                                await dg.send(item)
-                                print(f"[Q→DG] sent {len(item)} bytes to Deepgram")
                             except asyncio.TimeoutError:
-                                # Send KeepAlive — keeps connection alive between recordings
                                 try:
                                     await dg.send(json.dumps({"type": "KeepAlive"}))
-                                    print("[DG] KeepAlive sent")
+                                    print("[DG] KeepAlive")
                                 except Exception as e:
-                                    print(f"[DG KEEPALIVE ERROR] {e}")
-                                    break
-                            except Exception as e:
-                                print(f"[DG SENDER ERROR] {e}")
-                                break
+                                    print(f"[DG] KeepAlive fail: {e}")
+                                    return
+                                continue
 
-                    async def dg_receiver():
+                            if item is None:
+                                return
+                            if isinstance(item, dict):
+                                t = item["type"]
+                                if t == "finalize":
+                                    await dg.send(json.dumps({"type": "Finalize"}))
+                                    print("[DG] Finalize sent")
+                                elif t == "close":
+                                    dg_flushed.clear()   # mark: waiting for finals
+                                    await dg.send(json.dumps({"type": "CloseStream"}))
+                                    print("[DG] CloseStream sent")
+                                    return  # triggers reconnect
+                            else:
+                                await dg.send(item)
+                                print(f"[DG] audio {len(item)}b")
+
+                    async def receiver():
+                        last_final_was_empty = False
                         async for raw in dg:
                             try:
-                                raw_preview = raw if isinstance(raw, str) else str(raw)
-                                raw_preview = raw_preview.replace("\n", " ")[:300]
-                                print(f"[DG RAW] rec={recording_ctx['id']} {raw_preview}")
-
-                                data = json.loads(raw)
-                                msg_type = data.get("type", "")
-                                if msg_type == "KeepAlive":
-                                    print("[DG←] KeepAlive ack")
-                                    continue
-                                alt = data.get("channel", {}).get("alternatives", [{}])[0]
+                                data       = json.loads(raw)
+                                msg_type   = data.get("type", "")
+                                alt        = data.get("channel", {}).get("alternatives", [{}])[0]
                                 transcript = alt.get("transcript", "")
-                                is_final = data.get("is_final", False)
+                                is_final   = data.get("is_final", False)
                                 speech_final = data.get("speech_final", False)
-                                print(f"[DG←] type={msg_type} is_final={is_final} speech_final={speech_final} transcript='{transcript[:40]}'")
-                                if transcript and is_final:
-                                    print(f"[DG] fragment added: '{transcript}'")
-                                    transcript_buffer.append(transcript)
-                                elif is_final and not transcript:
-                                    print("[DG] received final event with empty transcript")
-                            except Exception as e:
-                                print(f"[DEEPGRAM PARSE ERROR] {e}")
+                                print(f"[DG←] final={is_final} speech_final={speech_final} '{transcript[:60]}'")
 
-                    await asyncio.gather(dg_sender(), dg_receiver())
-                    print("[DEEPGRAM] session finished")
+                                if transcript and is_final:
+                                    cur = rec_id
+                                    rec_bufs.setdefault(cur, []).append(transcript)
+                                    print(f"[DG] rec={cur} added: '{transcript}'")
+                                    last_final_was_empty = False
+
+                                # Deepgram signals end of stream with empty final + speech_final
+                                if is_final and not transcript:
+                                    if last_final_was_empty:
+                                        # two empty finals = stream fully flushed
+                                        dg_flushed.set()
+                                        print("[DG] stream flushed")
+                                    last_final_was_empty = True
+
+                                if msg_type == "Metadata":
+                                    dg_flushed.set()
+                                    print("[DG] Metadata received — flushed")
+
+                            except Exception as e:
+                                print(f"[DG PARSE] {e}")
+
+                    await asyncio.gather(sender(), receiver())
+                    print("[DG] session done — reconnecting")
 
             except Exception as e:
-                print(f"[DEEPGRAM SESSION ERROR] {e} — reconnecting in 1s")
+                print(f"[DG ERROR] {e} — retry 1s")
                 await asyncio.sleep(1)
             finally:
                 dg_ready.clear()
 
+    # ── LLM processor ────────────────────────────────────────
+
     async def transcript_processor():
         while True:
             transcript = await transcript_q.get()
-            await process_transcript(transcript)
+            if not transcript.strip():
+                continue
 
-    def drain_audio_queue() -> int:
-        dropped = 0
-        while True:
+            print(f"[TRANSCRIPT] {transcript}")
+            await tx(f"__user__{transcript}")
+
+            hist  = session["history"]
+            state = session["state"]
+
             try:
-                audio_q.get_nowait()
-                dropped += 1
-            except asyncio.QueueEmpty:
-                break
-        return dropped
+                reply, new_state, iso_dt = await asyncio.to_thread(
+                    groq_dialogue, hist, state, transcript
+                )
+            except Exception as e:
+                import traceback
+                print(f"[LLM ERROR] {e}")
+                traceback.print_exc()
+                await tx("__agent__Sorry, I had an error. Please try again.")
+                await tx("__mic_ready__")
+                continue
+            print(f"[REPLY] {reply}")
 
-    # Start per-session tasks
-    dg_task = asyncio.create_task(deepgram_task())
-    tr_task = asyncio.create_task(transcript_processor())
+            if iso_dt:
+                session["iso_datetime"] = iso_dt
+
+            await tx(f"__agent__{reply}")
+
+            if is_finalized(new_state):
+                try:
+                    ics_path = save_ics(new_state, session["iso_datetime"])
+                    session["ics_path"] = str(ics_path)
+                    await tx("__ics_ready__")
+                except Exception as e:
+                    print(f"[ICS ERROR] {e}")
+                session["history"]      = []
+                session["state"]        = empty_state()
+                session["iso_datetime"] = None
+                await speak(reply)
+                await tx("__show_start__")
+            else:
+                session["history"] = hist + [
+                    {"role": "user",      "content": transcript},
+                    {"role": "assistant", "content": reply},
+                ]
+                session["state"] = new_state
+                await speak(reply)
+                # __mic_ready__ is sent by browser after audio.onended
+
+    # ── flush after stop_rec (fire-and-forget task) ───────────
+
+    async def flush_recording(flushed_id: int, elapsed: float):
+        await tx_debug(f"[STOP_REC] rec={flushed_id} elapsed={elapsed:.2f}s — waiting for DG flush...")
+        await audio_q.put({"type": "finalize"})
+        await audio_q.put({"type": "close"})
+
+        # Give Deepgram 2s to return any remaining finals, then wait for flush signal
+        await asyncio.sleep(1.0)
+        try:
+            await asyncio.wait_for(dg_flushed.wait(), timeout=6.0)
+        except asyncio.TimeoutError:
+            print(f"[STOP_REC] rec={flushed_id} DG flush timeout — collecting anyway")
+
+        fragments = rec_bufs.pop(flushed_id, [])
+        full      = " ".join(fragments).strip()
+        await tx_debug(f"[STOP_REC] rec={flushed_id} → '{full}'")
+        if full:
+            await transcript_q.put(full)
+        else:
+            await tx_debug(f"[STOP_REC] rec={flushed_id} empty — skipped")
+            await tx("__mic_ready__")
+
+    # ── start background tasks ────────────────────────────────
+
+    dg_task  = asyncio.create_task(deepgram_task())
+    llm_task = asyncio.create_task(transcript_processor())
+
+    # ── receive loop ──────────────────────────────────────────
 
     try:
         while True:
-            msg = await ws.receive()
+            msg = await websocket.receive()
 
             if "text" in msg:
-                text = msg["text"]
-                if text == "__start__":
-                    app_state["history"] = []
-                    app_state["state"] = empty_state()
-                    app_state["iso_datetime"] = None
-                    greeting = initiate_text()
-                    app_state["history"] = [{"role": "assistant", "content": greeting}]
-                    await send_text(f"__agent__{greeting}")
+                cmd = msg["text"]
+
+                if cmd == "__start__":
+                    session.update(history=[], state=empty_state(), iso_datetime=None)
+                    greeting = await asyncio.to_thread(groq_initiate)
+                    session["history"] = [{"role": "assistant", "content": greeting}]
+                    await tx(f"__agent__{greeting}")
                     await speak(greeting)
+                    # __mic_ready__ sent by browser after audio.onended
 
-                elif text == "__start_rec__":
-                    dropped = drain_audio_queue()
-                    if dropped:
-                        await send_debug(f"[START_REC] dropped {dropped} stale queue items before starting")
+                elif cmd == "__start_rec__":
+                    # Block until DG is ready — no timeout guessing
                     if not dg_ready.is_set():
-                        await send_debug("[START_REC] waiting for Deepgram session to become ready...")
-                        try:
-                            await asyncio.wait_for(dg_ready.wait(), timeout=2.5)
-                        except asyncio.TimeoutError:
-                            await send_debug("[START_REC] Deepgram still not ready; this recording may fail")
+                        await tx_debug("[START_REC] waiting for Deepgram...")
+                        await dg_ready.wait()
+                        await tx_debug("[START_REC] Deepgram ready")
 
-                    recording_ctx["id"] += 1
-                    recording_ctx["started_at"] = asyncio.get_running_loop().time()
-                    recording_ctx["chunks"] = 0
-                    recording_ctx["bytes"] = 0
-                    await send_debug(
-                        f"[START_REC] rec={recording_ctx['id']} buffer cleared, q size={audio_q.qsize()}, recording started"
-                    )
-                    transcript_buffer.clear()
-                    is_recording["active"] = True
+                    rec_id     += 1
+                    rec_bufs[rec_id] = []
+                    rec_active  = True
+                    rec_started = asyncio.get_running_loop().time()
+                    await tx_debug(f"[START_REC] rec={rec_id}")
 
-                elif text == "__stop_rec__":
-                    is_recording["active"] = False
-                    elapsed = None
-                    if recording_ctx["started_at"] is not None:
-                        elapsed = asyncio.get_running_loop().time() - recording_ctx["started_at"]
-                    await send_debug(
-                        f"[STOP_REC] rec={recording_ctx['id']} chunks={recording_ctx['chunks']} bytes={recording_ctx['bytes']} elapsed={elapsed:.2f}s waiting for Deepgram to flush..."
-                        if elapsed is not None else
-                        f"[STOP_REC] rec={recording_ctx['id']} chunks={recording_ctx['chunks']} bytes={recording_ctx['bytes']} waiting for Deepgram to flush..."
-                    )
-                    # Flush and explicitly close current Deepgram stream so the next
-                    # recording starts on a fresh decoder session (important for
-                    # repeated MediaRecorder webm chunks).
-                    await audio_q.put({"type": "finalize"})
-                    await audio_q.put({"type": "close_stream"})
-                    # Wait for Deepgram to finish processing remaining audio
-                    await asyncio.sleep(1.8)
-                    full_transcript = " ".join(transcript_buffer).strip()
-                    await send_debug(
-                        f"[STOP_REC] rec={recording_ctx['id']} buffer had {len(transcript_buffer)} fragments: '{full_transcript}'"
-                    )
-                    transcript_buffer.clear()
-                    if full_transcript:
-                        await transcript_q.put(full_transcript)
-                    else:
-                        await send_debug(f"[STOP_REC] rec={recording_ctx['id']} buffer was empty — nothing sent to LLM")
+                elif cmd == "__stop_rec__":
+                    rec_active = False
+                    elapsed    = asyncio.get_running_loop().time() - rec_started
+                    asyncio.create_task(flush_recording(rec_id, elapsed))
 
             elif "bytes" in msg:
                 chunk = msg["bytes"]
-                if is_recording["active"]:
-                    recording_ctx["chunks"] += 1
-                    recording_ctx["bytes"] += len(chunk)
-                else:
-                    print("[WS→Q WARNING] received audio chunk while recording inactive")
-                print(
-                    f"[WS→Q] rec={recording_ctx['id']} audio chunk {len(chunk)} bytes, q size={audio_q.qsize()}, active={is_recording['active']}, dg_ready={dg_ready.is_set()}"
-                )
+                if not rec_active:
+                    continue
+                print(f"[WS→DG] rec={rec_id} {len(chunk)}b q={audio_q.qsize()}")
                 if dg_ready.is_set():
                     await audio_q.put(chunk)
-                else:
-                    print("[WS→Q WARNING] dropped chunk because Deepgram session is not ready")
 
     except WebSocketDisconnect:
-        print("[WS] Client disconnected")
+        print("[WS] disconnected")
     except Exception as e:
         print(f"[WS ERROR] {e}")
     finally:
         dg_task.cancel()
-        tr_task.cancel()
-        await audio_q.put(None)  # unblock sender
+        llm_task.cancel()
+        await audio_q.put(None)
 
-# ─────────────────────────────────────────
-# Frontend
-# ─────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────
+# Frontend HTML
+# ─────────────────────────────────────────────────────────────
 
 INDEX_HTML = """<!DOCTYPE html>
 <html>
@@ -638,8 +621,8 @@ INDEX_HTML = """<!DOCTYPE html>
 <title>Voice Scheduling Agent</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: Arial, sans-serif; background: #f0f2f5; display: flex;
-         justify-content: center; padding: 40px 16px; }
+  body { font-family: Arial, sans-serif; background: #f0f2f5;
+         display: flex; justify-content: center; padding: 40px 16px; }
   .container { width: 100%; max-width: 480px; }
   h2 { text-align: center; margin-bottom: 20px; color: #222; }
   #chat { background: #fff; border: 1px solid #ddd; border-radius: 10px;
@@ -647,17 +630,12 @@ INDEX_HTML = """<!DOCTYPE html>
   .user   { color: #222; margin: 6px 0; }
   .agent  { color: #0b5cff; margin: 6px 0; }
   .system { color: #999; font-size: 12px; margin: 4px 0; }
-  #startBtn {
-    display: block; width: 100%; padding: 14px;
-    background: #28a745; color: #fff; border: none;
-    border-radius: 8px; cursor: pointer; font-size: 16px;
-    margin-bottom: 10px;
-  }
-  #micBtn {
-    display: none; width: 100%; padding: 14px;
-    background: #0b5cff; color: #fff; border: none;
-    border-radius: 8px; cursor: pointer; font-size: 16px;
-  }
+  #startBtn { display: block; width: 100%; padding: 14px; background: #28a745;
+              color: #fff; border: none; border-radius: 8px; cursor: pointer;
+              font-size: 16px; margin-bottom: 10px; }
+  #micBtn   { display: none; width: 100%; padding: 14px; background: #0b5cff;
+              color: #fff; border: none; border-radius: 8px; cursor: pointer;
+              font-size: 16px; }
   #micBtn.recording { background: #dc3545; }
 </style>
 </head>
@@ -666,181 +644,117 @@ INDEX_HTML = """<!DOCTYPE html>
   <h2>&#128197; Voice Scheduling Agent</h2>
   <div id="chat"></div>
   <button id="startBtn" onclick="startChat()">START</button>
-  <button id="micBtn" onclick="toggleMic()">&#127908; Tap to record</button>
+  <button id="micBtn"   onclick="toggleMic()">&#127908; Tap to record</button>
 </div>
-
 <script>
-const chat    = document.getElementById("chat");
-const micBtn  = document.getElementById("micBtn");
+const chat     = document.getElementById("chat");
+const micBtn   = document.getElementById("micBtn");
 const startBtn = document.getElementById("startBtn");
-
-let ws, mediaRecorder, isRecording = false;
-let recordingSeq = 0;
+let ws, mediaRecorder, isRecording = false, recSeq = 0;
 
 function addMsg(text, cls) {
   const d = document.createElement("div");
-  d.className = cls;
-  d.textContent = text;
-  chat.appendChild(d);
-  chat.scrollTop = chat.scrollHeight;
+  d.className = cls; d.textContent = text;
+  chat.appendChild(d); chat.scrollTop = chat.scrollHeight;
 }
 
 function connectWS() {
   ws = new WebSocket(`ws://${location.host}/ws`);
   ws.binaryType = "arraybuffer";
-
-  ws.onopen = () => {
-    console.log("[WS] connected", new Date().toISOString());
-    addMsg("connected", "system");
-  };
+  ws.onopen  = () => { addMsg("connected", "system"); };
+  ws.onclose = e => { addMsg("disconnected", "system"); };
+  ws.onerror = e => { addMsg("connection error", "system"); };
 
   ws.onmessage = async ({ data }) => {
     if (typeof data === "string") {
       if (data === "__show_start__") {
         startBtn.style.display = "block";
-        micBtn.style.display = "none";
+        micBtn.style.display   = "none";
         if (isRecording) stopRecording();
-        addMsg("--- conversation finished ---", "system");
+        addMsg("--- done ---", "system");
         return;
       }
-      if (data.startsWith("__debug__")) {
-        const debugText = data.slice(9);
-        console.debug("[SERVER DEBUG]", debugText);
-        addMsg(debugText, "system");
+      if (data === "__mic_ready__") {
+        micBtn.disabled = false;
+        if (!isRecording) micBtn.textContent = "🎤 Tap to record";
         return;
       }
+      if (data.startsWith("__debug__"))  { addMsg(data.slice(9), "system"); return; }
       if (data === "__ics_ready__") {
-        const d = document.createElement("div");
-        d.className = "system";
-        d.innerHTML = '&#128197; <a href="/download-ics" download>Download calendar event (.ics)</a>';
-        chat.appendChild(d);
-        chat.scrollTop = chat.scrollHeight;
-        return;
+        const d = document.createElement("div"); d.className = "system";
+        d.innerHTML = '&#128197; <a href="/download-ics" download>Download .ics</a>';
+        chat.appendChild(d); chat.scrollTop = chat.scrollHeight; return;
       }
-      if (data.startsWith("__agent__")) {
-        addMsg("Agent: " + data.slice(9), "agent");
-        return;
-      }
-      if (data.startsWith("__user__")) {
-        addMsg("You: " + data.slice(8), "user");
-        return;
-      }
+      if (data.startsWith("__agent__")) { addMsg("Agent: " + data.slice(9), "agent"); return; }
+      if (data.startsWith("__user__"))  { addMsg("You: "  + data.slice(8),  "user");  return; }
     }
-
-    // Binary mp3 → play
     if (data instanceof ArrayBuffer) {
-      const blob = new Blob([data], { type: "audio/mpeg" });
-      const audio = new Audio(URL.createObjectURL(blob));
-      // Disable mic while agent is speaking
       micBtn.disabled = true;
+      micBtn.classList.remove("recording");
       micBtn.textContent = "🔊 Agent speaking...";
+      const audio = new Audio(URL.createObjectURL(new Blob([data], { type: "audio/mpeg" })));
       audio.onended = () => {
         micBtn.disabled = false;
-        micBtn.textContent = isRecording ? "⏹ Stop recording" : "🎤 Tap to record";
+        micBtn.textContent = "🎤 Tap to record";
       };
-      audio.play().catch(e => {
-        console.warn("Audio play failed:", e);
+      audio.play().catch(() => {
         micBtn.disabled = false;
         micBtn.textContent = "🎤 Tap to record";
       });
     }
   };
-
-  ws.onerror = (e) => {
-    console.error("[WS] error", e);
-    addMsg("connection error", "system");
-  };
-  ws.onclose = (e) => {
-    console.warn("[WS] closed", e.code, e.reason);
-    addMsg("disconnected", "system");
-  };
 }
 
-async function startChat() {
+function startChat() {
   startBtn.style.display = "none";
-  micBtn.style.display = "block";
-  console.log("[WS] send __start__");
+  micBtn.style.display   = "block";
+  micBtn.disabled = true;
+  micBtn.textContent = "⏳ Loading...";
   ws.send("__start__");
 }
 
-async function toggleMic() {
-  if (!isRecording) {
-    await startRecording();
-  } else {
-    stopRecording();
-  }
-}
+function toggleMic() { isRecording ? stopRecording() : startRecording(); }
 
 async function startRecording() {
   try {
-    recordingSeq += 1;
-    console.log(`[MIC][rec=${recordingSeq}] requesting getUserMedia...`);
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    console.log(`[MIC][rec=${recordingSeq}] stream obtained, tracks:`, stream.getTracks().length);
-
+    recSeq++;
+    const stream   = await navigator.mediaDevices.getUserMedia({ audio: true });
     const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-      ? "audio/webm;codecs=opus"
-      : "audio/webm";
-    console.log(`[MIC][rec=${recordingSeq}] using mimeType:`, mimeType);
-
-    mediaRecorder = new MediaRecorder(stream, { mimeType });
-
-    mediaRecorder.ondataavailable = (e) => {
-      console.log(`[MIC][rec=${recordingSeq}] chunk:`, e.data.size, "bytes", "wsState=", ws.readyState);
-      if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) {
-        ws.send(e.data);
-      }
+                     ? "audio/webm;codecs=opus" : "audio/webm";
+    mediaRecorder  = new MediaRecorder(stream, { mimeType });
+    mediaRecorder.ondataavailable = e => {
+      if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) ws.send(e.data);
     };
-
     mediaRecorder.start(250);
-    console.log(`[MIC][rec=${recordingSeq}] MediaRecorder started, state:`, mediaRecorder.state);
-    console.log(`[WS] send __start_rec__ rec=${recordingSeq}`);
     ws.send("__start_rec__");
     isRecording = true;
+    micBtn.disabled = false;
     micBtn.textContent = "⏹ Stop recording";
     micBtn.classList.add("recording");
-  } catch (e) {
-    console.error("[MIC ERROR]", e);
-    addMsg("Microphone error: " + e.message, "system");
-  }
+  } catch(e) { addMsg("Mic error: " + e.message, "system"); }
 }
 
 function stopRecording() {
-  console.log(`[MIC][rec=${recordingSeq}] stopRecording called, state:`, mediaRecorder ? mediaRecorder.state : "no recorder");
+  isRecording = false;
+  micBtn.disabled = true;
+  micBtn.textContent = "⏳ Processing...";
+  micBtn.classList.remove("recording");
+
   if (mediaRecorder && mediaRecorder.state !== "inactive") {
     mediaRecorder.onstop = () => {
-      console.log(`[MIC][rec=${recordingSeq}] onstop fired, sending __stop_rec__`);
-      console.log(`[WS] send __stop_rec__ rec=${recordingSeq}`);
       ws.send("__stop_rec__");
       mediaRecorder = null;
-      // Wait for Deepgram to reconnect before allowing next recording
-      micBtn.disabled = true;
-      micBtn.textContent = "⏳ Processing...";
-      setTimeout(() => {
-        if (!isRecording) {
-          micBtn.disabled = false;
-          micBtn.textContent = "🎤 Tap to record";
-        }
-      }, 2000);
+      // mic stays disabled until __mic_ready__ from server
     };
     mediaRecorder.stop();
-    mediaRecorder.stream.getTracks().forEach(t => { t.stop(); console.log(`[MIC][rec=${recordingSeq}] track stopped`); });
+    mediaRecorder.stream.getTracks().forEach(t => t.stop());
   } else {
-    console.log(`[MIC][rec=${recordingSeq}] recorder inactive, sending __stop_rec__ directly`);
-    console.log(`[WS] send __stop_rec__ rec=${recordingSeq}`);
     ws.send("__stop_rec__");
     mediaRecorder = null;
   }
-  isRecording = false;
-  micBtn.textContent = "🎤 Tap to record";
-  micBtn.classList.remove("recording");
 }
 
 connectWS();
 </script>
 </body>
 </html>"""
-
-@app.get("/")
-def index():
-    return HTMLResponse(INDEX_HTML)
