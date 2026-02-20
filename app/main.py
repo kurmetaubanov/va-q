@@ -3,25 +3,46 @@ Scheduling Agent — Groq + function calling
 pip install groq fastapi uvicorn
 GROQ_API_KEY=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 uvicorn app.main:app --reload
 """
+"""
+Voice Scheduling Agent
+- STT: Deepgram Streaming
+- LLM: Groq (llama-3.3-70b-versatile) + function calling
+- TTS: ElevenLabs mp3
 
+pip install groq fastapi uvicorn websockets icalendar httpx
+GROQ_API_KEY=...
+DEEPGRAM_API_KEY=...
+ELEVENLABS_API_KEY=...
+uvicorn main:app --reload
+"""
+
+import asyncio
 import json
 import os
-
-from fastapi import FastAPI, WebSocket
-from fastapi.responses import HTMLResponse
-from groq import Groq
+from datetime import datetime
 from pathlib import Path
-from fastapi.responses import FileResponse
-from starlette.websockets import WebSocketDisconnect
-from .calendar_export import save_ics
+
+import httpx
+import websockets
+from fastapi import FastAPI, WebSocket
+from fastapi.responses import FileResponse, HTMLResponse
+from groq import Groq
+from starlette.websockets import WebSocketDisconnect, WebSocketState
+
+from calendar_export import save_ics
 
 # ─────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────
 
+GROQ_API_KEY       = os.environ["GROQ_API_KEY"]
+DEEPGRAM_API_KEY   = os.environ["DEEPGRAM_API_KEY"]
+ELEVENLABS_API_KEY = os.environ["ELEVENLABS_API_KEY"]
+ELEVENLABS_VOICE   = os.environ.get("ELEVENLABS_VOICE_ID", "JBFqnCBsd6RMkjVDRZzb")  # default: George
+
 MODEL = "llama-3.3-70b-versatile"
 
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+groq_client = Groq(api_key=GROQ_API_KEY)
 
 # ─────────────────────────────────────────
 # State
@@ -78,7 +99,7 @@ TOOLS = [
                 "properties": {
                     "intent_description": {
                         "type": "string",
-                        "description": "Short description of the off-topic request, e.g. 'asked for Elixir LiveView code'"
+                        "description": "Short description of the off-topic request"
                     },
                     "severity": {
                         "type": "string",
@@ -110,17 +131,11 @@ TOOLS = [
                     },
                     "date": {
                         "anyOf": [{"type": "string"}, {"type": "null"}],
-                        "description": (
-                            "Single specific date (e.g. 'Monday', '2026-02-24'). "
-                            "Null if multiple dates mentioned or ambiguous."
-                        )
+                        "description": "Single specific date. Null if multiple or ambiguous."
                     },
                     "time": {
                         "anyOf": [{"type": "string"}, {"type": "null"}],
-                        "description": (
-                            "Single specific time (e.g. '3pm', '15:00'). "
-                            "Null if multiple times mentioned or ambiguous."
-                        )
+                        "description": "Single specific time. Null if multiple or ambiguous."
                     },
                     "title": {
                         "anyOf": [{"type": "string"}, {"type": "null"}],
@@ -166,6 +181,8 @@ TOOLS = [
 # ─────────────────────────────────────────
 
 def build_system(state, secondary_intent=None):
+    today = datetime.now().strftime("%A, %Y-%m-%d")
+
     drift_instruction = ""
     if secondary_intent:
         desc = secondary_intent.get("intent_description", "")
@@ -183,8 +200,6 @@ Acknowledge it very briefly (one short clause), then refocus on scheduling.
 Do not provide the off-topic content.
 """
 
-    from datetime import datetime as _dt
-    today = _dt.now().strftime("%A, %Y-%m-%d")
     return f"""You are a friendly voice scheduling assistant.
 
 Today is {today}.
@@ -200,12 +215,14 @@ Rules:
 - Finalize only after the user explicitly confirms all details.
 - Always call update_schedule to reflect any new information extracted.
 - If off-topic content is detected, call flag_secondary_intent and do NOT answer it.
-- When all info is collected and confirmed, set schedule_finalized=true and respond with ONE short closing sentence. Do NOT ask if there is anything else you can help with. Do NOT invite further conversation.
+- When all info is collected and confirmed, set schedule_finalized=true and respond
+  with ONE short closing sentence. Do NOT ask if there is anything else you can help with.
+  Do NOT invite further conversation.
 - Keep responses short and conversational.
 {drift_instruction}"""
 
 # ─────────────────────────────────────────
-# Core dialogue step
+# LLM dialogue step
 # ─────────────────────────────────────────
 
 def dialogue_step(history, state, user_msg):
@@ -220,7 +237,7 @@ def dialogue_step(history, state, user_msg):
 
     messages = history + [{"role": "user", "content": user_msg}]
 
-    response = client.chat.completions.create(
+    response = groq_client.chat.completions.create(
         model=MODEL,
         messages=[{"role": "system", "content": build_system(state)}] + messages,
         tools=TOOLS,
@@ -229,49 +246,40 @@ def dialogue_step(history, state, user_msg):
         max_tokens=512,
     )
 
-    choice = response.choices[0]
-    message = choice.message
-
+    message = response.choices[0].message
     reply_text = message.content or ""
     new_state = state
     secondary_intent = None
 
-    # ── Process tool calls ──
     if message.tool_calls:
-        for tool_call in message.tool_calls:
-            name = tool_call.function.name
+        for tc in message.tool_calls:
+            name = tc.function.name
             try:
-                args = json.loads(tool_call.function.arguments)
-            except json.JSONDecodeError as e:
-                print(f"[TOOL ERROR] {name}: {e}")
+                args = json.loads(tc.function.arguments)
+            except json.JSONDecodeError:
                 continue
 
             if name == "update_schedule":
                 new_state = merge_state(state, args)
-                print(f"\n[TOOL] update_schedule: {args}")
-                print(f"[STATE] {new_state}\n")
+                print(f"[TOOL] update_schedule: {args}")
+                print(f"[STATE] {new_state}")
 
             elif name == "flag_secondary_intent":
                 secondary_intent = args
-                print(f"\n[TOOL] flag_secondary_intent: {args}\n")
+                print(f"[TOOL] flag_secondary_intent: {args}")
 
             elif name == "resolve_datetime":
                 app_state["iso_datetime"] = args.get("iso_datetime")
-                print(f"\n[TOOL] resolve_datetime: {args}\n")
+                print(f"[TOOL] resolve_datetime: {args}")
 
     # ── If model returned tool calls but no text → request reply ──
     # secondary_intent is injected into system prompt so model knows to block the drift
     if message.tool_calls and not reply_text:
         tool_results = [
-            {
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": "ok"
-            }
+            {"role": "tool", "tool_call_id": tc.id, "content": "ok"}
             for tc in message.tool_calls
         ]
-
-        followup = client.chat.completions.create(
+        followup = groq_client.chat.completions.create(
             model=MODEL,
             messages=[
                 {"role": "system", "content": build_system(new_state, secondary_intent)},
@@ -284,17 +292,34 @@ def dialogue_step(history, state, user_msg):
         )
         reply_text = followup.choices[0].message.content or "Got it!"
 
-    should_reset = is_finalized(new_state)
+    return reply_text, new_state, is_finalized(new_state)
 
-    return reply_text, new_state, should_reset
+# ─────────────────────────────────────────
+# ElevenLabs TTS
+# ─────────────────────────────────────────
 
+async def text_to_speech(text: str) -> bytes:
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE}"
+    headers = {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "text": text,
+        "model_id": "eleven_turbo_v2_5",
+        "voice_settings": {"stability": 0.4, "similarity_boost": 0.8},
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(url, headers=headers, json=payload)
+        r.raise_for_status()
+        return r.content  # mp3 bytes
 
 # ─────────────────────────────────────────
 # Initiator
 # ─────────────────────────────────────────
 
-def initiate():
-    response = client.chat.completions.create(
+def initiate_text() -> str:
+    response = groq_client.chat.completions.create(
         model=MODEL,
         messages=[
             {
@@ -313,48 +338,308 @@ def initiate():
     )
     return response.choices[0].message.content.strip()
 
-
 # ─────────────────────────────────────────
-# FastAPI + WebSocket
+# FastAPI
 # ─────────────────────────────────────────
 
 app = FastAPI()
 
-INDEX_HTML = """
-<!DOCTYPE html>
+@app.get("/download-ics")
+def download_ics():
+    path = app_state.get("ics_path")
+    if not path or not Path(path).exists():
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="No .ics file available yet")
+    return FileResponse(path, media_type="text/calendar", filename=Path(path).name)
+
+@app.get("/debug")
+def debug():
+    return {k: v for k, v in app_state.items() if k != "history"}
+
+# ─────────────────────────────────────────
+# Main WebSocket — browser ↔ server
+# ─────────────────────────────────────────
+
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket):
+    await ws.accept()
+
+    async def send_text(msg: str):
+        if ws.client_state == WebSocketState.CONNECTED:
+            await ws.send_text(msg)
+
+    async def send_audio(data: bytes):
+        if ws.client_state == WebSocketState.CONNECTED:
+            await ws.send_bytes(data)
+
+    async def speak(text: str):
+        """TTS → send mp3 to browser."""
+        try:
+            audio = await text_to_speech(text)
+            await send_audio(audio)
+        except Exception as e:
+            print(f"[TTS ERROR] {e}")
+
+    async def handle_transcript(transcript: str):
+        """Process final transcript through LLM pipeline."""
+        if not transcript.strip():
+            return
+
+        print(f"[TRANSCRIPT] {transcript}")
+        await send_text(f"__user__{transcript}")  # echo to UI
+
+        history = app_state["history"]
+        state = app_state["state"]
+
+        reply, new_state, should_reset = dialogue_step(history, state, transcript)
+        print(f"[REPLY] {reply}")
+
+        new_history = history + [
+            {"role": "user", "content": transcript},
+            {"role": "assistant", "content": reply},
+        ]
+
+        if should_reset:
+            try:
+                iso_dt = app_state.get("iso_datetime")
+                if not iso_dt:
+                    raise ValueError("iso_datetime not resolved")
+                ics_path = save_ics(new_state, iso_dt)
+                app_state["ics_path"] = str(ics_path)
+                print(f"[ICS] saved to {ics_path}")
+                await send_text("__ics_ready__")
+            except Exception as e:
+                print(f"[ICS ERROR] {e}")
+
+            app_state["history"] = []
+            app_state["state"] = empty_state()
+            app_state["iso_datetime"] = None
+            await speak(reply)
+            await send_text("__show_start__")
+        else:
+            app_state["history"] = new_history
+            app_state["state"] = new_state
+            await speak(reply)
+
+    try:
+        while True:
+            msg = await ws.receive()
+
+            # ── Text control messages ──
+            if "text" in msg:
+                text = msg["text"]
+
+                if text == "__start__":
+                    app_state["history"] = []
+                    app_state["state"] = empty_state()
+                    app_state["iso_datetime"] = None
+                    greeting = initiate_text()
+                    app_state["history"] = [{"role": "assistant", "content": greeting}]
+                    await send_text(f"__agent__{greeting}")
+                    await speak(greeting)
+
+                else:
+                    # typed text fallback (for testing without mic)
+                    await handle_transcript(text)
+
+            # ── Binary audio from browser → stream to Deepgram ──
+            elif "bytes" in msg:
+                audio_chunk = msg["bytes"]
+                # forward to Deepgram via shared queue
+                await audio_queue.put(audio_chunk)
+
+    except WebSocketDisconnect:
+        print("[WS] Client disconnected")
+
+    except Exception as e:
+        print(f"[WS ERROR] {e}")
+
+# ─────────────────────────────────────────
+# Deepgram streaming task (per connection)
+# ─────────────────────────────────────────
+
+audio_queue: asyncio.Queue = asyncio.Queue()
+
+DEEPGRAM_URL = (
+    "wss://api.deepgram.com/v1/listen"
+    "?encoding=webm-opus"
+    "&sample_rate=48000"
+    "&channels=1"
+    "&model=nova-2"
+    "&language=en-US"
+    "&punctuate=true"
+    "&interim_results=true"
+    "&endpointing=400"
+)
+
+@app.on_event("startup")
+async def start_deepgram_task():
+    asyncio.create_task(deepgram_streaming_task())
+
+async def deepgram_streaming_task():
+    """
+    Persistent connection to Deepgram.
+    Reads audio from audio_queue, sends to Deepgram,
+    receives transcripts and processes them.
+    """
+    headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
+
+    while True:
+        try:
+            async with websockets.connect(DEEPGRAM_URL, extra_headers=headers) as dg_ws:
+                print("[DEEPGRAM] connected")
+
+                async def sender():
+                    while True:
+                        chunk = await audio_queue.get()
+                        if dg_ws.open:
+                            await dg_ws.send(chunk)
+
+                async def receiver():
+                    async for raw in dg_ws:
+                        try:
+                            data = json.loads(raw)
+                            alt = (
+                                data.get("channel", {})
+                                    .get("alternatives", [{}])[0]
+                            )
+                            transcript = alt.get("transcript", "")
+                            is_final = data.get("is_final", False)
+
+                            if transcript and is_final:
+                                # Run in main event loop — we need access to ws
+                                # We'll use a second queue to pass transcripts back
+                                await transcript_queue.put(transcript)
+                        except Exception as e:
+                            print(f"[DEEPGRAM PARSE ERROR] {e}")
+
+                await asyncio.gather(sender(), receiver())
+
+        except Exception as e:
+            print(f"[DEEPGRAM ERROR] {e} — reconnecting in 2s")
+            await asyncio.sleep(2)
+
+transcript_queue: asyncio.Queue = asyncio.Queue()
+
+@app.on_event("startup")
+async def start_transcript_processor():
+    asyncio.create_task(transcript_processor())
+
+async def transcript_processor():
+    """
+    Reads from transcript_queue and processes through LLM.
+    Needs access to active WebSocket — stored in active_ws.
+    """
+    while True:
+        transcript = await transcript_queue.get()
+        ws = active_ws.get("ws")
+        if ws and ws.client_state == WebSocketState.CONNECTED:
+            # Re-use handle logic via a small shim
+            await _process_transcript_for_ws(ws, transcript)
+
+active_ws: dict = {}
+
+async def _process_transcript_for_ws(ws: WebSocket, transcript: str):
+    async def send_text(msg):
+        if ws.client_state == WebSocketState.CONNECTED:
+            await ws.send_text(msg)
+
+    async def speak(text):
+        try:
+            audio = await text_to_speech(text)
+            if ws.client_state == WebSocketState.CONNECTED:
+                await ws.send_bytes(audio)
+        except Exception as e:
+            print(f"[TTS ERROR] {e}")
+
+    print(f"[TRANSCRIPT] {transcript}")
+    await send_text(f"__user__{transcript}")
+
+    history = app_state["history"]
+    state = app_state["state"]
+    reply, new_state, should_reset = dialogue_step(history, state, transcript)
+    print(f"[REPLY] {reply}")
+
+    new_history = history + [
+        {"role": "user", "content": transcript},
+        {"role": "assistant", "content": reply},
+    ]
+
+    if should_reset:
+        try:
+            iso_dt = app_state.get("iso_datetime")
+            if not iso_dt:
+                raise ValueError("iso_datetime not resolved")
+            ics_path = save_ics(new_state, iso_dt)
+            app_state["ics_path"] = str(ics_path)
+            await send_text("__ics_ready__")
+        except Exception as e:
+            print(f"[ICS ERROR] {e}")
+        app_state["history"] = []
+        app_state["state"] = empty_state()
+        app_state["iso_datetime"] = None
+        await speak(reply)
+        await send_text("__show_start__")
+    else:
+        app_state["history"] = new_history
+        app_state["state"] = new_state
+        await speak(reply)
+
+# Register active ws on connect
+_original_ws = ws_endpoint.__wrapped__ if hasattr(ws_endpoint, "__wrapped__") else None
+
+# ─────────────────────────────────────────
+# Frontend
+# ─────────────────────────────────────────
+
+INDEX_HTML = """<!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>Scheduling Agent</title>
+<title>Voice Scheduling Agent</title>
 <style>
-  body { font-family: Arial; margin: 40px; background: #f5f5f5; }
-  #chat {
-    border: 1px solid #ddd; padding: 15px;
-    height: 380px; overflow-y: auto;
-    background: #fff; border-radius: 8px;
-    margin-bottom: 12px;
-  }
-  .user   { color: #222; margin: 6px 0; }
-  .agent  { color: #0b5cff; margin: 6px 0; }
-  .system { color: #aaa; font-size: 12px; margin: 4px 0; }
-  input   { width: 68%; padding: 9px; border-radius: 4px; border: 1px solid #ccc; }
-  button  { padding: 9px 16px; border-radius: 4px; border: none;
-            background: #0b5cff; color: #fff; cursor: pointer; }
-  button:hover { background: #0040cc; }
-  #startBtn { background: #28a745; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: Arial, sans-serif; background: #f0f2f5; display: flex;
+         justify-content: center; padding: 40px 16px; }
+  .container { width: 100%; max-width: 560px; }
+  h2 { text-align: center; margin-bottom: 20px; color: #222; }
+  #chat { background: #fff; border: 1px solid #ddd; border-radius: 10px;
+          padding: 16px; height: 360px; overflow-y: auto; margin-bottom: 14px; }
+  .user  { color: #222; margin: 6px 0; }
+  .agent { color: #0b5cff; margin: 6px 0; }
+  .system { color: #999; font-size: 12px; margin: 4px 0; }
+  .controls { display: flex; gap: 10px; margin-bottom: 10px; }
+  #startBtn { flex: 1; padding: 10px; background: #28a745; color: #fff;
+              border: none; border-radius: 6px; cursor: pointer; font-size: 15px; }
+  #micBtn { flex: 1; padding: 10px; background: #0b5cff; color: #fff;
+            border: none; border-radius: 6px; cursor: pointer; font-size: 15px; }
+  #micBtn.recording { background: #dc3545; }
+  .text-row { display: flex; gap: 8px; }
+  #msg { flex: 1; padding: 9px; border-radius: 6px; border: 1px solid #ccc; }
+  #sendBtn { padding: 9px 16px; background: #555; color: #fff;
+             border: none; border-radius: 6px; cursor: pointer; }
 </style>
 </head>
 <body>
-<h2>&#128197; Scheduling Agent</h2>
-<div id="chat"></div>
-<button id="startBtn" onclick="startChat()">START</button>
-<br><br>
-<input id="msg" placeholder="Type a message..." />
-<button onclick="send()">Send</button>
+<div class="container">
+  <h2>&#128197; Voice Scheduling Agent</h2>
+  <div id="chat"></div>
+  <div class="controls">
+    <button id="startBtn" onclick="startChat()">START</button>
+    <button id="micBtn" onclick="toggleMic()" disabled>&#127908; Hold to speak</button>
+  </div>
+  <div class="text-row">
+    <input id="msg" placeholder="Or type a message..." />
+    <button id="sendBtn" onclick="sendText()">Send</button>
+  </div>
+</div>
 
 <script>
 const chat = document.getElementById("chat");
+const micBtn = document.getElementById("micBtn");
 const startBtn = document.getElementById("startBtn");
+
+let ws, mediaRecorder, audioCtx, isRecording = false;
 
 function addMsg(text, cls) {
   const d = document.createElement("div");
@@ -364,117 +649,111 @@ function addMsg(text, cls) {
   chat.scrollTop = chat.scrollHeight;
 }
 
-const ws = new WebSocket(`ws://${location.host}/ws`);
+function connectWS() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.binaryType = "arraybuffer";
 
-ws.onopen = () => {
-  addMsg("connected", "system");
-  startBtn.style.display = "inline-block";
-};
-
-ws.onmessage = ({ data }) => {
-  if (data === "__show_start__") {
+  ws.onopen = () => {
+    addMsg("connected", "system");
     startBtn.style.display = "inline-block";
-    addMsg("--- conversation finished ---", "system");
-    return;
-  }
-  if (data === "__ics_ready__") {
-    const d = document.createElement("div");
-    d.className = "system";
-    d.innerHTML = '&#128197; <a href="/download-ics" download>Download calendar event (.ics)</a>';
-    chat.appendChild(d);
-    chat.scrollTop = chat.scrollHeight;
-    return;
-  }
-  addMsg("Agent: " + data, "agent");
-};
+  };
 
-ws.onerror = () => addMsg("connection error", "system");
-ws.onclose = () => addMsg("disconnected", "system");
+  ws.onmessage = async ({ data }) => {
+    if (typeof data === "string") {
+      if (data === "__show_start__") {
+        startBtn.style.display = "inline-block";
+        micBtn.disabled = true;
+        addMsg("--- conversation finished ---", "system");
+        return;
+      }
+      if (data === "__ics_ready__") {
+        const d = document.createElement("div");
+        d.className = "system";
+        d.innerHTML = '&#128197; <a href="/download-ics" download>Download calendar event (.ics)</a>';
+        chat.appendChild(d);
+        chat.scrollTop = chat.scrollHeight;
+        return;
+      }
+      if (data.startsWith("__agent__")) {
+        addMsg("Agent: " + data.slice(9), "agent");
+        return;
+      }
+      if (data.startsWith("__user__")) {
+        addMsg("You: " + data.slice(8), "user");
+        return;
+      }
+    }
 
-function startChat() {
-  ws.send("__start__");
-  startBtn.style.display = "none";
+    // Binary mp3 audio → play
+    if (data instanceof ArrayBuffer) {
+      const blob = new Blob([data], { type: "audio/mpeg" });
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audio.play().catch(e => console.warn("Audio play failed:", e));
+    }
+  };
+
+  ws.onerror = () => addMsg("connection error", "system");
+  ws.onclose = () => addMsg("disconnected", "system");
 }
 
-function send() {
+async function startChat() {
+  startBtn.style.display = "none";
+  ws.send("__start__");
+  micBtn.disabled = false;
+}
+
+// ── Microphone recording ──
+async function toggleMic() {
+  if (!isRecording) {
+    await startRecording();
+  } else {
+    stopRecording();
+  }
+}
+
+async function startRecording() {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm;codecs=opus" });
+
+  mediaRecorder.ondataavailable = (e) => {
+    if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) {
+      ws.send(e.data);
+    }
+  };
+
+  mediaRecorder.start(250); // send chunks every 250ms
+  isRecording = true;
+  micBtn.textContent = "🔴 Recording... (click to stop)";
+  micBtn.classList.add("recording");
+}
+
+function stopRecording() {
+  if (mediaRecorder) {
+    mediaRecorder.stop();
+    mediaRecorder.stream.getTracks().forEach(t => t.stop());
+  }
+  isRecording = false;
+  micBtn.textContent = "🎤 Hold to speak";
+  micBtn.classList.remove("recording");
+}
+
+function sendText() {
   const msg = document.getElementById("msg").value.trim();
-  if (!msg) return;
+  if (!msg || !ws || ws.readyState !== WebSocket.OPEN) return;
   addMsg("You: " + msg, "user");
   ws.send(msg);
   document.getElementById("msg").value = "";
 }
 
 document.getElementById("msg")
-  .addEventListener("keypress", e => { if (e.key === "Enter") send(); });
+  .addEventListener("keypress", e => { if (e.key === "Enter") sendText(); });
+
+connectWS();
 </script>
 </body>
-</html>
-"""
+</html>"""
 
 @app.get("/")
 def index():
     return HTMLResponse(INDEX_HTML)
-
-@app.get("/debug")
-def debug():
-    return app_state
-
-@app.get("/download-ics")
-def download_ics():
-    path = app_state.get("ics_path")
-    if not path or not Path(path).exists():
-        from fastapi import HTTPException
-        raise HTTPException(status_code=404, detail="No .ics file available yet")
-    return FileResponse(
-        path,
-        media_type="text/calendar",
-        filename=Path(path).name,
-    )
-
-@app.websocket("/ws")
-async def ws_endpoint(ws: WebSocket):
-    await ws.accept()
-    try:
-        while True:
-            msg = await ws.receive_text()
-
-            if msg == "__start__":
-                greeting = initiate()
-                app_state["history"] = [{"role": "assistant", "content": greeting}]
-                app_state["state"] = empty_state()
-                await ws.send_text(greeting)
-                continue
-
-            history = app_state["history"]
-            state = app_state["state"]
-
-            reply, new_state, should_reset = dialogue_step(history, state, msg)
-
-            new_history = history + [
-                {"role": "user", "content": msg},
-                {"role": "assistant", "content": reply},
-            ]
-
-            if should_reset:
-                # Generate .ics before resetting state
-                try:
-                    iso_dt = app_state.get("iso_datetime")
-                    if not iso_dt:
-                        raise ValueError("iso_datetime not resolved by LLM")
-                    ics_path = save_ics(new_state, iso_dt)
-                    app_state["ics_path"] = str(ics_path)
-                    print(f"[ICS] saved to {ics_path}")
-                    await ws.send_text(f"__ics_ready__")
-                except Exception as e:
-                    print(f"[ICS ERROR] {e}")
-                app_state["history"] = []
-                app_state["state"] = empty_state()
-                await ws.send_text(reply)
-                await ws.send_text("__show_start__")
-            else:
-                app_state["history"] = new_history
-                app_state["state"] = new_state
-                await ws.send_text(reply)
-
-    except WebSocketDisconnect:
-        print("Client disconnected")
