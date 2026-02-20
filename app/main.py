@@ -1,7 +1,7 @@
 """
 Scheduling Agent — Groq + function calling
 pip install groq fastapi uvicorn
-GROQ_API_KEY=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 uvicorn main:app --reload
+GROQ_API_KEY=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 uvicorn app.main:app --reload
 """
 
 import json
@@ -72,25 +72,25 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "user_name": {
-                        "type": "string",
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
                         "description": "User's name. Only set if the user clearly stated it."
                     },
                     "date": {
-                        "type": "string",
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
                         "description": (
                             "Single specific date (e.g. 'Monday', '2026-02-24'). "
                             "Null if multiple dates mentioned or ambiguous."
                         )
                     },
                     "time": {
-                        "type": "string",
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
                         "description": (
                             "Single specific time (e.g. '3pm', '15:00'). "
                             "Null if multiple times mentioned or ambiguous."
                         )
                     },
                     "title": {
-                        "type": "string",
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
                         "description": "Optional meeting title."
                     },
                     "schedule_finalized": {
