@@ -1,9 +1,4 @@
 """
-Scheduling Agent — Groq + function calling
-pip install groq fastapi uvicorn
-GROQ_API_KEY=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 uvicorn app.main:app --reload
-"""
-"""
 Voice Scheduling Agent
 - STT: Deepgram Streaming
 - LLM: Groq (llama-3.3-70b-versatile) + function calling
@@ -23,13 +18,15 @@ from datetime import datetime
 from pathlib import Path
 
 import httpx
-import websockets
+from dotenv import load_dotenv
+
+load_dotenv()
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import FileResponse, HTMLResponse
 from groq import Groq
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
-from calendar_export import save_ics
+from .calendar_export import save_ics
 
 # ─────────────────────────────────────────
 # Config
@@ -226,15 +223,6 @@ Rules:
 # ─────────────────────────────────────────
 
 def dialogue_step(history, state, user_msg):
-    """
-    Single LLM call with two tools:
-      - flag_secondary_intent  → detected off-topic content
-      - update_schedule        → extract scheduling fields
-
-    Both can be called in the same turn.
-    Returns (reply_text, new_state, should_reset).
-    """
-
     messages = history + [{"role": "user", "content": user_msg}]
 
     response = groq_client.chat.completions.create(
@@ -272,8 +260,6 @@ def dialogue_step(history, state, user_msg):
                 app_state["iso_datetime"] = args.get("iso_datetime")
                 print(f"[TOOL] resolve_datetime: {args}")
 
-    # ── If model returned tool calls but no text → request reply ──
-    # secondary_intent is injected into system prompt so model knows to block the drift
     if message.tool_calls and not reply_text:
         tool_results = [
             {"role": "tool", "tool_call_id": tc.id, "content": "ok"}
@@ -460,12 +446,9 @@ async def ws_endpoint(ws: WebSocket):
 
 audio_queue: asyncio.Queue = asyncio.Queue()
 
-DEEPGRAM_URL = (
+DEEPGRAM_WS_URL = (
     "wss://api.deepgram.com/v1/listen"
-    "?encoding=webm-opus"
-    "&sample_rate=48000"
-    "&channels=1"
-    "&model=nova-2"
+    "?model=nova-2"
     "&language=en-US"
     "&punctuate=true"
     "&interim_results=true"
@@ -478,37 +461,34 @@ async def start_deepgram_task():
 
 async def deepgram_streaming_task():
     """
-    Persistent connection to Deepgram.
-    Reads audio from audio_queue, sends to Deepgram,
-    receives transcripts and processes them.
+    Deepgram streaming via raw websockets (compatible with websockets 16.x).
     """
-    headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
+    import websockets
 
     while True:
         try:
-            async with websockets.connect(DEEPGRAM_URL, extra_headers=headers) as dg_ws:
+            async with websockets.connect(
+                DEEPGRAM_WS_URL,
+                additional_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
+            ) as dg_ws:
                 print("[DEEPGRAM] connected")
 
                 async def sender():
                     while True:
                         chunk = await audio_queue.get()
-                        if dg_ws.open:
+                        try:
                             await dg_ws.send(chunk)
+                        except Exception:
+                            break
 
                 async def receiver():
                     async for raw in dg_ws:
                         try:
                             data = json.loads(raw)
-                            alt = (
-                                data.get("channel", {})
-                                    .get("alternatives", [{}])[0]
-                            )
+                            alt = data.get("channel", {}).get("alternatives", [{}])[0]
                             transcript = alt.get("transcript", "")
                             is_final = data.get("is_final", False)
-
                             if transcript and is_final:
-                                # Run in main event loop — we need access to ws
-                                # We'll use a second queue to pass transcripts back
                                 await transcript_queue.put(transcript)
                         except Exception as e:
                             print(f"[DEEPGRAM PARSE ERROR] {e}")
