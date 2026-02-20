@@ -353,7 +353,7 @@ DEEPGRAM_WS_URL = (
     "&language=en-US"
     "&punctuate=true"
     "&interim_results=true"
-    "&endpointing=1200"
+    "&endpointing=400"
 )
 
 @app.websocket("/ws")
@@ -370,6 +370,9 @@ async def ws_endpoint(ws: WebSocket):
     audio_q: asyncio.Queue = asyncio.Queue()
     # Per-session transcript queue: Deepgram → LLM
     transcript_q: asyncio.Queue = asyncio.Queue()
+    # Buffer accumulates partial transcripts while recording
+    transcript_buffer: list = []
+    is_recording: dict = {"active": False}
 
     async def send_text(msg: str):
         try:
@@ -427,27 +430,34 @@ async def ws_endpoint(ws: WebSocket):
             await speak(reply)
 
     async def deepgram_task():
-        """Own Deepgram WS for this session."""
+        """
+        Persistent Deepgram connection for the entire browser session.
+        Sends KeepAlive every 5s to prevent timeout between recordings.
+        """
         while True:
             try:
                 async with ws_lib.connect(
                     DEEPGRAM_WS_URL,
                     additional_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
+                    ping_interval=None,  # disable websockets ping, we use DG KeepAlive
                 ) as dg:
                     print("[DEEPGRAM] session connected")
 
                     async def dg_sender():
                         while True:
                             try:
-                                chunk = await asyncio.wait_for(audio_q.get(), timeout=3.0)
+                                chunk = await asyncio.wait_for(audio_q.get(), timeout=5.0)
                                 if chunk is None:
                                     break
                                 await dg.send(chunk)
+                                print(f"[Q→DG] sent {len(chunk)} bytes to Deepgram")
                             except asyncio.TimeoutError:
-                                # Send KeepAlive to prevent Deepgram timeout
+                                # Send KeepAlive — keeps connection alive between recordings
                                 try:
                                     await dg.send(json.dumps({"type": "KeepAlive"}))
-                                except Exception:
+                                    print("[DG] KeepAlive sent")
+                                except Exception as e:
+                                    print(f"[DG KEEPALIVE ERROR] {e}")
                                     break
                             except Exception as e:
                                 print(f"[DG SENDER ERROR] {e}")
@@ -457,11 +467,17 @@ async def ws_endpoint(ws: WebSocket):
                         async for raw in dg:
                             try:
                                 data = json.loads(raw)
+                                msg_type = data.get("type", "")
+                                if msg_type == "KeepAlive":
+                                    continue
                                 alt = data.get("channel", {}).get("alternatives", [{}])[0]
                                 transcript = alt.get("transcript", "")
                                 is_final = data.get("is_final", False)
+                                speech_final = data.get("speech_final", False)
+                                print(f"[DG←] type={msg_type} is_final={is_final} speech_final={speech_final} transcript='{transcript[:40]}'")
                                 if transcript and is_final:
-                                    await transcript_q.put(transcript)
+                                    print(f"[DG] fragment added: '{transcript}'")
+                                    transcript_buffer.append(transcript)
                             except Exception as e:
                                 print(f"[DEEPGRAM PARSE ERROR] {e}")
 
@@ -495,8 +511,28 @@ async def ws_endpoint(ws: WebSocket):
                     await send_text(f"__agent__{greeting}")
                     await speak(greeting)
 
+                elif text == "__start_rec__":
+                    print(f"[START_REC] buffer cleared, q size={audio_q.qsize()}, recording started")
+                    transcript_buffer.clear()
+                    is_recording["active"] = True
+
+                elif text == "__stop_rec__":
+                    is_recording["active"] = False
+                    print(f"[STOP_REC] waiting for Deepgram to flush...")
+                    # Wait for Deepgram to finish processing remaining audio
+                    await asyncio.sleep(1.5)
+                    full_transcript = " ".join(transcript_buffer).strip()
+                    print(f"[STOP_REC] buffer had {len(transcript_buffer)} fragments: '{full_transcript}'")
+                    transcript_buffer.clear()
+                    if full_transcript:
+                        await transcript_q.put(full_transcript)
+                    else:
+                        print("[STOP_REC] buffer was empty — nothing sent to LLM")
+
             elif "bytes" in msg:
-                await audio_q.put(msg["bytes"])
+                chunk = msg["bytes"]
+                print(f"[WS→Q] audio chunk {len(chunk)} bytes, q size={audio_q.qsize()}")
+                await audio_q.put(chunk)
 
     except WebSocketDisconnect:
         print("[WS] Client disconnected")
@@ -638,31 +674,59 @@ async function toggleMic() {
 
 async function startRecording() {
   try {
+    console.log("[MIC] requesting getUserMedia...");
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    console.log("[MIC] stream obtained, tracks:", stream.getTracks().length);
+
     const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
       ? "audio/webm;codecs=opus"
       : "audio/webm";
+    console.log("[MIC] using mimeType:", mimeType);
+
     mediaRecorder = new MediaRecorder(stream, { mimeType });
 
     mediaRecorder.ondataavailable = (e) => {
+      console.log("[MIC] chunk:", e.data.size, "bytes");
       if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) {
         ws.send(e.data);
       }
     };
 
     mediaRecorder.start(250);
+    console.log("[MIC] MediaRecorder started, state:", mediaRecorder.state);
+    ws.send("__start_rec__");
     isRecording = true;
     micBtn.textContent = "⏹ Stop recording";
     micBtn.classList.add("recording");
   } catch (e) {
+    console.error("[MIC ERROR]", e);
     addMsg("Microphone error: " + e.message, "system");
   }
 }
 
 function stopRecording() {
+  console.log("[MIC] stopRecording called, state:", mediaRecorder ? mediaRecorder.state : "no recorder");
   if (mediaRecorder && mediaRecorder.state !== "inactive") {
+    mediaRecorder.onstop = () => {
+      console.log("[MIC] onstop fired, sending __stop_rec__");
+      ws.send("__stop_rec__");
+      mediaRecorder = null;
+      // Wait for Deepgram to reconnect before allowing next recording
+      micBtn.disabled = true;
+      micBtn.textContent = "⏳ Processing...";
+      setTimeout(() => {
+        if (!isRecording) {
+          micBtn.disabled = false;
+          micBtn.textContent = "🎤 Tap to record";
+        }
+      }, 2000);
+    };
     mediaRecorder.stop();
-    mediaRecorder.stream.getTracks().forEach(t => t.stop());
+    mediaRecorder.stream.getTracks().forEach(t => { t.stop(); console.log("[MIC] track stopped"); });
+  } else {
+    console.log("[MIC] recorder inactive, sending __stop_rec__ directly");
+    ws.send("__stop_rec__");
+    mediaRecorder = null;
   }
   isRecording = false;
   micBtn.textContent = "🎤 Tap to record";
