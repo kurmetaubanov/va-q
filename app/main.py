@@ -35,9 +35,10 @@ from .calendar_export import save_ics
 GROQ_API_KEY       = os.environ["GROQ_API_KEY"]
 DEEPGRAM_API_KEY   = os.environ["DEEPGRAM_API_KEY"]
 ELEVENLABS_API_KEY = os.environ["ELEVENLABS_API_KEY"]
-ELEVENLABS_VOICE   = os.environ.get("ELEVENLABS_VOICE_ID", "JBFqnCBsd6RMkjVDRZzb")  # default: George
+ELEVENLABS_VOICE   = os.environ["ELEVENLABS_VOICE_ID"]
 
 MODEL = "llama-3.3-70b-versatile"
+TTS_ENABLED = True  # set True to enable ElevenLabs TTS
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
@@ -346,37 +347,55 @@ def debug():
 # Main WebSocket — browser ↔ server
 # ─────────────────────────────────────────
 
+DEEPGRAM_WS_URL = (
+    "wss://api.deepgram.com/v1/listen"
+    "?model=nova-2"
+    "&language=en-US"
+    "&punctuate=true"
+    "&interim_results=true"
+    "&endpointing=400"
+)
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
+    """
+    One WebSocket per browser session.
+    Opens its own Deepgram connection — no global queues.
+    """
+    import websockets as ws_lib
+
     await ws.accept()
 
-    async def send_text(msg: str):
-        if ws.client_state == WebSocketState.CONNECTED:
-            await ws.send_text(msg)
+    # Per-session audio queue: browser → Deepgram
+    audio_q: asyncio.Queue = asyncio.Queue()
+    # Per-session transcript queue: Deepgram → LLM
+    transcript_q: asyncio.Queue = asyncio.Queue()
 
-    async def send_audio(data: bytes):
-        if ws.client_state == WebSocketState.CONNECTED:
-            await ws.send_bytes(data)
+    async def send_text(msg: str):
+        try:
+            if ws.client_state == WebSocketState.CONNECTED:
+                await ws.send_text(msg)
+        except Exception:
+            pass
 
     async def speak(text: str):
-        """TTS → send mp3 to browser."""
+        if not TTS_ENABLED:
+            return
         try:
             audio = await text_to_speech(text)
-            await send_audio(audio)
+            if ws.client_state == WebSocketState.CONNECTED:
+                await ws.send_bytes(audio)
         except Exception as e:
             print(f"[TTS ERROR] {e}")
 
-    async def handle_transcript(transcript: str):
-        """Process final transcript through LLM pipeline."""
+    async def process_transcript(transcript: str):
         if not transcript.strip():
             return
-
         print(f"[TRANSCRIPT] {transcript}")
-        await send_text(f"__user__{transcript}")  # echo to UI
+        await send_text(f"__user__{transcript}")
 
         history = app_state["history"]
         state = app_state["state"]
-
         reply, new_state, should_reset = dialogue_step(history, state, transcript)
         print(f"[REPLY] {reply}")
 
@@ -385,6 +404,8 @@ async def ws_endpoint(ws: WebSocket):
             {"role": "assistant", "content": reply},
         ]
 
+        await send_text(f"__agent__{reply}")
+
         if should_reset:
             try:
                 iso_dt = app_state.get("iso_datetime")
@@ -392,11 +413,9 @@ async def ws_endpoint(ws: WebSocket):
                     raise ValueError("iso_datetime not resolved")
                 ics_path = save_ics(new_state, iso_dt)
                 app_state["ics_path"] = str(ics_path)
-                print(f"[ICS] saved to {ics_path}")
                 await send_text("__ics_ready__")
             except Exception as e:
                 print(f"[ICS ERROR] {e}")
-
             app_state["history"] = []
             app_state["state"] = empty_state()
             app_state["iso_datetime"] = None
@@ -407,14 +426,66 @@ async def ws_endpoint(ws: WebSocket):
             app_state["state"] = new_state
             await speak(reply)
 
+    async def deepgram_task():
+        """Own Deepgram WS for this session."""
+        while True:
+            try:
+                async with ws_lib.connect(
+                    DEEPGRAM_WS_URL,
+                    additional_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
+                ) as dg:
+                    print("[DEEPGRAM] session connected")
+
+                    async def dg_sender():
+                        while True:
+                            try:
+                                chunk = await asyncio.wait_for(audio_q.get(), timeout=3.0)
+                                if chunk is None:
+                                    break
+                                await dg.send(chunk)
+                            except asyncio.TimeoutError:
+                                # Send KeepAlive to prevent Deepgram timeout
+                                try:
+                                    await dg.send(json.dumps({"type": "KeepAlive"}))
+                                except Exception:
+                                    break
+                            except Exception as e:
+                                print(f"[DG SENDER ERROR] {e}")
+                                break
+
+                    async def dg_receiver():
+                        async for raw in dg:
+                            try:
+                                data = json.loads(raw)
+                                alt = data.get("channel", {}).get("alternatives", [{}])[0]
+                                transcript = alt.get("transcript", "")
+                                is_final = data.get("is_final", False)
+                                if transcript and is_final:
+                                    await transcript_q.put(transcript)
+                            except Exception as e:
+                                print(f"[DEEPGRAM PARSE ERROR] {e}")
+
+                    await asyncio.gather(dg_sender(), dg_receiver())
+
+            except Exception as e:
+                print(f"[DEEPGRAM SESSION ERROR] {e} — reconnecting in 1s")
+                await asyncio.sleep(1)
+
+    async def transcript_processor():
+        while True:
+            transcript = await transcript_q.get()
+            await process_transcript(transcript)
+
+    # Start per-session tasks
+    dg_task = asyncio.create_task(deepgram_task())
+    tr_task = asyncio.create_task(transcript_processor())
+
     try:
         while True:
             msg = await ws.receive()
 
-            # ── Text control messages ──
             if "text" in msg:
                 text = msg["text"]
-
                 if text == "__start__":
                     app_state["history"] = []
                     app_state["state"] = empty_state()
@@ -424,149 +495,17 @@ async def ws_endpoint(ws: WebSocket):
                     await send_text(f"__agent__{greeting}")
                     await speak(greeting)
 
-                else:
-                    # typed text fallback (for testing without mic)
-                    await handle_transcript(text)
-
-            # ── Binary audio from browser → stream to Deepgram ──
             elif "bytes" in msg:
-                audio_chunk = msg["bytes"]
-                # forward to Deepgram via shared queue
-                await audio_queue.put(audio_chunk)
+                await audio_q.put(msg["bytes"])
 
     except WebSocketDisconnect:
         print("[WS] Client disconnected")
-
     except Exception as e:
         print(f"[WS ERROR] {e}")
-
-# ─────────────────────────────────────────
-# Deepgram streaming task (per connection)
-# ─────────────────────────────────────────
-
-audio_queue: asyncio.Queue = asyncio.Queue()
-
-DEEPGRAM_WS_URL = (
-    "wss://api.deepgram.com/v1/listen"
-    "?model=nova-2"
-    "&language=en-US"
-    "&punctuate=true"
-    "&interim_results=true"
-    "&endpointing=400"
-)
-
-@app.on_event("startup")
-async def start_deepgram_task():
-    asyncio.create_task(deepgram_streaming_task())
-
-async def deepgram_streaming_task():
-    """
-    Deepgram streaming via raw websockets (compatible with websockets 16.x).
-    """
-    import websockets
-
-    while True:
-        try:
-            async with websockets.connect(
-                DEEPGRAM_WS_URL,
-                additional_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
-            ) as dg_ws:
-                print("[DEEPGRAM] connected")
-
-                async def sender():
-                    while True:
-                        chunk = await audio_queue.get()
-                        try:
-                            await dg_ws.send(chunk)
-                        except Exception:
-                            break
-
-                async def receiver():
-                    async for raw in dg_ws:
-                        try:
-                            data = json.loads(raw)
-                            alt = data.get("channel", {}).get("alternatives", [{}])[0]
-                            transcript = alt.get("transcript", "")
-                            is_final = data.get("is_final", False)
-                            if transcript and is_final:
-                                await transcript_queue.put(transcript)
-                        except Exception as e:
-                            print(f"[DEEPGRAM PARSE ERROR] {e}")
-
-                await asyncio.gather(sender(), receiver())
-
-        except Exception as e:
-            print(f"[DEEPGRAM ERROR] {e} — reconnecting in 2s")
-            await asyncio.sleep(2)
-
-transcript_queue: asyncio.Queue = asyncio.Queue()
-
-@app.on_event("startup")
-async def start_transcript_processor():
-    asyncio.create_task(transcript_processor())
-
-async def transcript_processor():
-    """
-    Reads from transcript_queue and processes through LLM.
-    Needs access to active WebSocket — stored in active_ws.
-    """
-    while True:
-        transcript = await transcript_queue.get()
-        ws = active_ws.get("ws")
-        if ws and ws.client_state == WebSocketState.CONNECTED:
-            # Re-use handle logic via a small shim
-            await _process_transcript_for_ws(ws, transcript)
-
-active_ws: dict = {}
-
-async def _process_transcript_for_ws(ws: WebSocket, transcript: str):
-    async def send_text(msg):
-        if ws.client_state == WebSocketState.CONNECTED:
-            await ws.send_text(msg)
-
-    async def speak(text):
-        try:
-            audio = await text_to_speech(text)
-            if ws.client_state == WebSocketState.CONNECTED:
-                await ws.send_bytes(audio)
-        except Exception as e:
-            print(f"[TTS ERROR] {e}")
-
-    print(f"[TRANSCRIPT] {transcript}")
-    await send_text(f"__user__{transcript}")
-
-    history = app_state["history"]
-    state = app_state["state"]
-    reply, new_state, should_reset = dialogue_step(history, state, transcript)
-    print(f"[REPLY] {reply}")
-
-    new_history = history + [
-        {"role": "user", "content": transcript},
-        {"role": "assistant", "content": reply},
-    ]
-
-    if should_reset:
-        try:
-            iso_dt = app_state.get("iso_datetime")
-            if not iso_dt:
-                raise ValueError("iso_datetime not resolved")
-            ics_path = save_ics(new_state, iso_dt)
-            app_state["ics_path"] = str(ics_path)
-            await send_text("__ics_ready__")
-        except Exception as e:
-            print(f"[ICS ERROR] {e}")
-        app_state["history"] = []
-        app_state["state"] = empty_state()
-        app_state["iso_datetime"] = None
-        await speak(reply)
-        await send_text("__show_start__")
-    else:
-        app_state["history"] = new_history
-        app_state["state"] = new_state
-        await speak(reply)
-
-# Register active ws on connect
-_original_ws = ws_endpoint.__wrapped__ if hasattr(ws_endpoint, "__wrapped__") else None
+    finally:
+        dg_task.cancel()
+        tr_task.cancel()
+        await audio_q.put(None)  # unblock sender
 
 # ─────────────────────────────────────────
 # Frontend
@@ -581,45 +520,41 @@ INDEX_HTML = """<!DOCTYPE html>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: Arial, sans-serif; background: #f0f2f5; display: flex;
          justify-content: center; padding: 40px 16px; }
-  .container { width: 100%; max-width: 560px; }
+  .container { width: 100%; max-width: 480px; }
   h2 { text-align: center; margin-bottom: 20px; color: #222; }
   #chat { background: #fff; border: 1px solid #ddd; border-radius: 10px;
-          padding: 16px; height: 360px; overflow-y: auto; margin-bottom: 14px; }
-  .user  { color: #222; margin: 6px 0; }
-  .agent { color: #0b5cff; margin: 6px 0; }
+          padding: 16px; height: 380px; overflow-y: auto; margin-bottom: 20px; }
+  .user   { color: #222; margin: 6px 0; }
+  .agent  { color: #0b5cff; margin: 6px 0; }
   .system { color: #999; font-size: 12px; margin: 4px 0; }
-  .controls { display: flex; gap: 10px; margin-bottom: 10px; }
-  #startBtn { flex: 1; padding: 10px; background: #28a745; color: #fff;
-              border: none; border-radius: 6px; cursor: pointer; font-size: 15px; }
-  #micBtn { flex: 1; padding: 10px; background: #0b5cff; color: #fff;
-            border: none; border-radius: 6px; cursor: pointer; font-size: 15px; }
+  #startBtn {
+    display: block; width: 100%; padding: 14px;
+    background: #28a745; color: #fff; border: none;
+    border-radius: 8px; cursor: pointer; font-size: 16px;
+    margin-bottom: 10px;
+  }
+  #micBtn {
+    display: none; width: 100%; padding: 14px;
+    background: #0b5cff; color: #fff; border: none;
+    border-radius: 8px; cursor: pointer; font-size: 16px;
+  }
   #micBtn.recording { background: #dc3545; }
-  .text-row { display: flex; gap: 8px; }
-  #msg { flex: 1; padding: 9px; border-radius: 6px; border: 1px solid #ccc; }
-  #sendBtn { padding: 9px 16px; background: #555; color: #fff;
-             border: none; border-radius: 6px; cursor: pointer; }
 </style>
 </head>
 <body>
 <div class="container">
   <h2>&#128197; Voice Scheduling Agent</h2>
   <div id="chat"></div>
-  <div class="controls">
-    <button id="startBtn" onclick="startChat()">START</button>
-    <button id="micBtn" onclick="toggleMic()" disabled>&#127908; Hold to speak</button>
-  </div>
-  <div class="text-row">
-    <input id="msg" placeholder="Or type a message..." />
-    <button id="sendBtn" onclick="sendText()">Send</button>
-  </div>
+  <button id="startBtn" onclick="startChat()">START</button>
+  <button id="micBtn" onclick="toggleMic()">&#127908; Tap to record</button>
 </div>
 
 <script>
-const chat = document.getElementById("chat");
-const micBtn = document.getElementById("micBtn");
+const chat    = document.getElementById("chat");
+const micBtn  = document.getElementById("micBtn");
 const startBtn = document.getElementById("startBtn");
 
-let ws, mediaRecorder, audioCtx, isRecording = false;
+let ws, mediaRecorder, isRecording = false;
 
 function addMsg(text, cls) {
   const d = document.createElement("div");
@@ -635,14 +570,14 @@ function connectWS() {
 
   ws.onopen = () => {
     addMsg("connected", "system");
-    startBtn.style.display = "inline-block";
   };
 
   ws.onmessage = async ({ data }) => {
     if (typeof data === "string") {
       if (data === "__show_start__") {
-        startBtn.style.display = "inline-block";
-        micBtn.disabled = true;
+        startBtn.style.display = "block";
+        micBtn.style.display = "none";
+        if (isRecording) stopRecording();
         addMsg("--- conversation finished ---", "system");
         return;
       }
@@ -664,11 +599,10 @@ function connectWS() {
       }
     }
 
-    // Binary mp3 audio → play
+    // Binary mp3 → play
     if (data instanceof ArrayBuffer) {
       const blob = new Blob([data], { type: "audio/mpeg" });
-      const url = URL.createObjectURL(blob);
-      const audio = new Audio(url);
+      const audio = new Audio(URL.createObjectURL(blob));
       audio.play().catch(e => console.warn("Audio play failed:", e));
     }
   };
@@ -679,11 +613,10 @@ function connectWS() {
 
 async function startChat() {
   startBtn.style.display = "none";
+  micBtn.style.display = "block";
   ws.send("__start__");
-  micBtn.disabled = false;
 }
 
-// ── Microphone recording ──
 async function toggleMic() {
   if (!isRecording) {
     await startRecording();
@@ -693,41 +626,37 @@ async function toggleMic() {
 }
 
 async function startRecording() {
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm;codecs=opus" });
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+      ? "audio/webm;codecs=opus"
+      : "audio/webm";
+    mediaRecorder = new MediaRecorder(stream, { mimeType });
 
-  mediaRecorder.ondataavailable = (e) => {
-    if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) {
-      ws.send(e.data);
-    }
-  };
+    mediaRecorder.ondataavailable = (e) => {
+      if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) {
+        ws.send(e.data);
+      }
+    };
 
-  mediaRecorder.start(250); // send chunks every 250ms
-  isRecording = true;
-  micBtn.textContent = "🔴 Recording... (click to stop)";
-  micBtn.classList.add("recording");
+    mediaRecorder.start(250);
+    isRecording = true;
+    micBtn.textContent = "⏹ Stop recording";
+    micBtn.classList.add("recording");
+  } catch (e) {
+    addMsg("Microphone error: " + e.message, "system");
+  }
 }
 
 function stopRecording() {
-  if (mediaRecorder) {
+  if (mediaRecorder && mediaRecorder.state !== "inactive") {
     mediaRecorder.stop();
     mediaRecorder.stream.getTracks().forEach(t => t.stop());
   }
   isRecording = false;
-  micBtn.textContent = "🎤 Hold to speak";
+  micBtn.textContent = "🎤 Tap to record";
   micBtn.classList.remove("recording");
 }
-
-function sendText() {
-  const msg = document.getElementById("msg").value.trim();
-  if (!msg || !ws || ws.readyState !== WebSocket.OPEN) return;
-  addMsg("You: " + msg, "user");
-  ws.send(msg);
-  document.getElementById("msg").value = "";
-}
-
-document.getElementById("msg")
-  .addEventListener("keypress", e => { if (e.key === "Enter") sendText(); });
 
 connectWS();
 </script>
