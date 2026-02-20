@@ -160,7 +160,14 @@ TOOLS = [
                             "AND the user has explicitly confirmed the booking."
                         )
                     },
-
+                    "iso_datetime": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "description": (
+                            "ISO 8601 datetime string e.g. '2026-02-27T05:00:00'. "
+                            "Set this whenever both date and time are known. "
+                            "MUST be non-null when schedule_finalized=true."
+                        )
+                    }
                 },
                 "required": ["schedule_finalized"]
             }
@@ -281,6 +288,12 @@ def groq_dialogue(history: list, state: dict, user_msg: str) -> tuple[str, dict,
                 new_state = merge_state(state, args)
                 print(f"[TOOL] update_schedule: {args}")
                 print(f"[STATE] {new_state}")
+                if args.get("iso_datetime"):
+                    iso_datetime = args["iso_datetime"]
+                    print(f"[TOOL] iso_datetime: {iso_datetime}")
+                if args.get("iso_datetime"):
+                    iso_datetime = args["iso_datetime"]
+                    print(f"[TOOL] iso_datetime: {iso_datetime}")
 
             elif name == "validate_datetime":
                 print(f"[TOOL] validate_datetime: {args}")
@@ -531,10 +544,7 @@ async def ws_endpoint(websocket: WebSocket):
 
             if is_finalized(new_state):
                 try:
-                    iso_dt = session.get("iso_datetime")
-                    if not iso_dt:
-                        raise ValueError("resolve_datetime was not called — iso_datetime is None")
-                    ics_path = save_ics(new_state, iso_dt)
+                    ics_path = save_ics(new_state, session["iso_datetime"])
                     session["ics_path"] = str(ics_path)
                     await tx("__ics_ready__")
                 except Exception as e:
