@@ -459,10 +459,15 @@ async def ws_endpoint(ws: WebSocket):
                                 item = await asyncio.wait_for(audio_q.get(), timeout=5.0)
                                 if item is None:
                                     break
-                                if isinstance(item, dict) and item.get("type") == "finalize":
-                                    await dg.send(json.dumps({"type": "Finalize"}))
-                                    print("[Q→DG] Finalize sent to Deepgram")
-                                    continue
+                                if isinstance(item, dict):
+                                    if item.get("type") == "finalize":
+                                        await dg.send(json.dumps({"type": "Finalize"}))
+                                        print("[Q→DG] Finalize sent to Deepgram")
+                                        continue
+                                    if item.get("type") == "close_stream":
+                                        await dg.send(json.dumps({"type": "CloseStream"}))
+                                        print("[Q→DG] CloseStream sent to Deepgram")
+                                        break
 
                                 await dg.send(item)
                                 print(f"[Q→DG] sent {len(item)} bytes to Deepgram")
@@ -554,10 +559,13 @@ async def ws_endpoint(ws: WebSocket):
                         if elapsed is not None else
                         f"[STOP_REC] rec={recording_ctx['id']} chunks={recording_ctx['chunks']} bytes={recording_ctx['bytes']} waiting for Deepgram to flush..."
                     )
-                    # Force Deepgram to flush final transcript for current utterance.
+                    # Flush and explicitly close current Deepgram stream so the next
+                    # recording starts on a fresh decoder session (important for
+                    # repeated MediaRecorder webm chunks).
                     await audio_q.put({"type": "finalize"})
+                    await audio_q.put({"type": "close_stream"})
                     # Wait for Deepgram to finish processing remaining audio
-                    await asyncio.sleep(1.5)
+                    await asyncio.sleep(1.8)
                     full_transcript = " ".join(transcript_buffer).strip()
                     await send_debug(
                         f"[STOP_REC] rec={recording_ctx['id']} buffer had {len(transcript_buffer)} fragments: '{full_transcript}'"
