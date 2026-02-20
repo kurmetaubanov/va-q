@@ -1,0 +1,85 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# compiled extensions
+*.so
+
+# distribution
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# logs
+*.log
+
+# =========================
+# Virtual environments
+# =========================
+venv/
+.venv/
+env/
+ENV/
+
+# conda
+conda-meta/
+
+# =========================
+# IDE & editors
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# =========================
+# Environment variables
+# =========================
+.env
+.env.*
+*.env
+
+# =========================
+# OS files
+# =========================
+Thumbs.db
+.DS_Store
+
+# =========================
+# Node (if frontend later)
+# =========================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# =========================
+# Audio temp files
+# =========================
+*.wav
+*.mp3
+*.ogg
+recordings/
+
+# =========================
+# Cache & temp
+# =========================
+.cache/
+tmp/
+temp/
+
+# =========================
+# Logs & debug output
+# =========================
+debug.log
+debug/
+
+# =========================
+# Local model data (if any)
+# =========================
+models/
