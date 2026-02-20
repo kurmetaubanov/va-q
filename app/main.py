@@ -339,6 +339,11 @@ def download_ics():
         raise HTTPException(status_code=404, detail="No .ics file available yet")
     return FileResponse(path, media_type="text/calendar", filename=Path(path).name)
 
+@app.get("/favicon.ico")
+def favicon():
+    icon_path = Path(__file__).with_name("favicon.ico")
+    return FileResponse(icon_path)
+
 @app.get("/debug")
 def debug():
     return {k: v for k, v in app_state.items() if k != "history"}
@@ -446,11 +451,16 @@ async def ws_endpoint(ws: WebSocket):
                     async def dg_sender():
                         while True:
                             try:
-                                chunk = await asyncio.wait_for(audio_q.get(), timeout=5.0)
-                                if chunk is None:
+                                item = await asyncio.wait_for(audio_q.get(), timeout=5.0)
+                                if item is None:
                                     break
-                                await dg.send(chunk)
-                                print(f"[Q→DG] sent {len(chunk)} bytes to Deepgram")
+                                if isinstance(item, dict) and item.get("type") == "finalize":
+                                    await dg.send(json.dumps({"type": "Finalize"}))
+                                    print("[Q→DG] Finalize sent to Deepgram")
+                                    continue
+
+                                await dg.send(item)
+                                print(f"[Q→DG] sent {len(item)} bytes to Deepgram")
                             except asyncio.TimeoutError:
                                 # Send KeepAlive — keeps connection alive between recordings
                                 try:
@@ -519,6 +529,8 @@ async def ws_endpoint(ws: WebSocket):
                 elif text == "__stop_rec__":
                     is_recording["active"] = False
                     print(f"[STOP_REC] waiting for Deepgram to flush...")
+                    # Force Deepgram to flush final transcript for current utterance.
+                    await audio_q.put({"type": "finalize"})
                     # Wait for Deepgram to finish processing remaining audio
                     await asyncio.sleep(1.5)
                     full_transcript = " ".join(transcript_buffer).strip()
