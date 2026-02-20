@@ -163,7 +163,8 @@ TOOLS = [
 # ─────────────────────────────────────────────────────────────
 
 def _build_system(state: dict, secondary_intent: dict | None = None) -> str:
-    today = datetime.now().strftime("%A, %Y-%m-%d")
+    now   = datetime.now()
+    today = now.strftime("%A, %Y-%m-%d %H:%M")
 
     drift_instruction = ""
     if secondary_intent:
@@ -192,8 +193,11 @@ Current schedule state:
 Rules:
 - Greet the user only once at the very start of the conversation.
 - Collect: user_name, date, time, and optionally a meeting title.
-- Schedule only ONE meeting at a time.
+- Only ONE schedule at a time.
 - If the user mentions multiple dates or times, ask them to choose ONE. Never assume.
+- If the user requests a recurring schedule (e.g. "every Tuesday"), inform them that
+  only a single appointment can be booked.
+- If the specified time is in the past, reject it and ask the user to provide a future date and time.
 - Finalize only after the user explicitly confirms all details.
 - Always call update_schedule to reflect any new information extracted.
 - If off-topic content is detected, call flag_secondary_intent and do NOT answer it.
@@ -533,11 +537,12 @@ async def ws_endpoint(websocket: WebSocket):
 
     async def flush_recording(flushed_id: int, elapsed: float):
         await tx_debug(f"[STOP_REC] rec={flushed_id} elapsed={elapsed:.2f}s — waiting for DG flush...")
+        # Clear BEFORE sending close so we don't catch the previous session's signal
+        dg_flushed.clear()
         await audio_q.put({"type": "finalize"})
         await audio_q.put({"type": "close"})
 
-        # Give Deepgram 2s to return any remaining finals, then wait for flush signal
-        await asyncio.sleep(1.0)
+        # Wait for Deepgram to signal end of stream (Metadata or double empty final)
         try:
             await asyncio.wait_for(dg_flushed.wait(), timeout=6.0)
         except asyncio.TimeoutError:
