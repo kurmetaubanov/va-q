@@ -35,7 +35,7 @@ from .calendar_export import save_ics
 GROQ_API_KEY       = os.environ["GROQ_API_KEY"]
 DEEPGRAM_API_KEY   = os.environ["DEEPGRAM_API_KEY"]
 ELEVENLABS_API_KEY = os.environ["ELEVENLABS_API_KEY"]
-ELEVENLABS_VOICE   = os.environ["ELEVENLABS_VOICE_ID"]
+ELEVENLABS_VOICE   = os.environ.get("ELEVENLABS_VOICE_ID", "JBFqnCBsd6RMkjVDRZzb")  # default: George
 
 MODEL = "llama-3.3-70b-versatile"
 TTS_ENABLED = True  # set True to enable ElevenLabs TTS
@@ -353,7 +353,7 @@ DEEPGRAM_WS_URL = (
     "&language=en-US"
     "&punctuate=true"
     "&interim_results=true"
-    "&endpointing=400"
+    "&endpointing=1200"
 )
 
 @app.websocket("/ws")
@@ -603,7 +603,18 @@ function connectWS() {
     if (data instanceof ArrayBuffer) {
       const blob = new Blob([data], { type: "audio/mpeg" });
       const audio = new Audio(URL.createObjectURL(blob));
-      audio.play().catch(e => console.warn("Audio play failed:", e));
+      // Disable mic while agent is speaking
+      micBtn.disabled = true;
+      micBtn.textContent = "🔊 Agent speaking...";
+      audio.onended = () => {
+        micBtn.disabled = false;
+        micBtn.textContent = isRecording ? "⏹ Stop recording" : "🎤 Tap to record";
+      };
+      audio.play().catch(e => {
+        console.warn("Audio play failed:", e);
+        micBtn.disabled = false;
+        micBtn.textContent = "🎤 Tap to record";
+      });
     }
   };
 
