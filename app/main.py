@@ -99,6 +99,32 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "validate_datetime",
+            "description": (
+                "Set is_past=true only if: "
+                "(1) the date is clearly before today, OR "
+                "(2) the date is today AND the time is also known AND that time has already passed. "
+                "Set is_past=false when the date is in the future."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "is_past": {
+                        "type": "boolean",
+                        "description": "True only if the full datetime is confirmed to be in the past."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Brief explanation, e.g. 'February 15 at 9 AM has already passed.'"
+                    }
+                },
+                "required": ["is_past"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "update_schedule",
             "description": (
                 "Extract and update scheduling information from the conversation. "
@@ -129,30 +155,17 @@ TOOLS = [
                             "Set to true ONLY when user_name, date, and time are all known "
                             "AND the user has explicitly confirmed the booking."
                         )
+                    },
+                    "iso_datetime": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "description": (
+                            "ISO 8601 datetime string (e.g. '2026-02-21T17:00:00'). "
+                            "Set this whenever both date and time are known. "
+                            "Use the current date and weekday from the system prompt as reference."
+                        )
                     }
                 },
                 "required": ["schedule_finalized"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "resolve_datetime",
-            "description": (
-                "Call this when schedule_finalized becomes true. "
-                "Convert the natural language date and time from the schedule "
-                "into an ISO 8601 datetime string, using today's date as reference."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "iso_datetime": {
-                        "type": "string",
-                        "description": "Resolved datetime in ISO 8601 format, e.g. '2026-02-21T17:00:00'"
-                    }
-                },
-                "required": ["iso_datetime"]
             }
         }
     }
@@ -162,9 +175,16 @@ TOOLS = [
 # Pure sync functions — run via asyncio.to_thread, never block loop
 # ─────────────────────────────────────────────────────────────
 
-def _build_system(state: dict, secondary_intent: dict | None = None) -> str:
+def _build_system(state: dict, secondary_intent: dict | None = None, past_datetime: str | None = None) -> str:
     now   = datetime.now()
     today = now.strftime("%A, %Y-%m-%d %H:%M")
+
+    past_instruction = ""
+    if past_datetime:
+        past_instruction = f"""
+IMPORTANT: The date/time the user provided is in the past: "{past_datetime}".
+Do NOT continue or finalyze. Tell the user this date/time has already passed and ask them to provide a future date and time.
+"""
 
     drift_instruction = ""
     if secondary_intent:
@@ -193,11 +213,10 @@ Current schedule state:
 Rules:
 - Greet the user only once at the very start of the conversation.
 - Collect: user_name, date, time, and optionally a meeting title.
-- Only ONE schedule at a time.
+- Schedule only ONE meeting at a time.
 - If the user mentions multiple dates or times, ask them to choose ONE. Never assume.
 - If the user requests a recurring schedule (e.g. "every Tuesday"), inform them that
-  only a single appointment can be booked.
-- If the specified time is in the past, reject it and ask the user to provide a future date and time.
+  only a single appointment can be booked, and offer the nearest upcoming occurrence.
 - Finalize only after the user explicitly confirms all details.
 - Always call update_schedule to reflect any new information extracted.
 - If off-topic content is detected, call flag_secondary_intent and do NOT answer it.
@@ -205,7 +224,7 @@ Rules:
   with ONE short closing sentence. Do NOT ask if there is anything else you can help with.
   Do NOT invite further conversation.
 - Keep responses short and conversational.
-{drift_instruction}"""
+{past_instruction}{drift_instruction}"""
 
 
 def groq_initiate() -> str:
@@ -239,7 +258,7 @@ def groq_dialogue(history: list, state: dict, user_msg: str) -> tuple[str, dict,
 
     response = groq_client.chat.completions.create(
         model=MODEL,
-        messages=[{"role": "system", "content": _build_system(state)}] + messages,
+        messages=[{"role": "system", "content": _build_system(state, past_datetime=None)}] + messages,
         tools=TOOLS,
         tool_choice="auto",
         temperature=0.5,
@@ -251,6 +270,7 @@ def groq_dialogue(history: list, state: dict, user_msg: str) -> tuple[str, dict,
     new_state    = state
     secondary_intent = None
     iso_datetime = None
+    past_datetime = None
 
     if message.tool_calls:
         for tc in message.tool_calls:
@@ -264,14 +284,19 @@ def groq_dialogue(history: list, state: dict, user_msg: str) -> tuple[str, dict,
                 new_state = merge_state(state, args)
                 print(f"[TOOL] update_schedule: {args}")
                 print(f"[STATE] {new_state}")
+                if args.get("iso_datetime"):
+                    iso_datetime = args["iso_datetime"]
+                    print(f"[TOOL] iso_datetime: {iso_datetime}")
+
+            elif name == "validate_datetime":
+                print(f"[TOOL] validate_datetime: {args}")
+                if args.get("is_past"):
+                    past_datetime = args.get("reason", "The specified date and time is in the past.")
+                    print(f"[TOOL] past datetime detected: {past_datetime}")
 
             elif name == "flag_secondary_intent":
                 secondary_intent = args
                 print(f"[TOOL] flag_secondary_intent: {args}")
-
-            elif name == "resolve_datetime":
-                iso_datetime = args.get("iso_datetime")
-                print(f"[TOOL] resolve_datetime: {iso_datetime}")
 
     if message.tool_calls and not reply_text:
         tool_results = [
@@ -281,7 +306,7 @@ def groq_dialogue(history: list, state: dict, user_msg: str) -> tuple[str, dict,
         followup = groq_client.chat.completions.create(
             model=MODEL,
             messages=[
-                {"role": "system", "content": _build_system(new_state, secondary_intent)},
+                {"role": "system", "content": _build_system(new_state, secondary_intent, past_datetime)},
                 *messages,
                 {"role": "assistant", "content": None, "tool_calls": message.tool_calls},
                 *tool_results,
@@ -514,7 +539,10 @@ async def ws_endpoint(websocket: WebSocket):
 
             if is_finalized(new_state):
                 try:
-                    ics_path = save_ics(new_state, session["iso_datetime"])
+                    iso_dt = session.get("iso_datetime")
+                    if not iso_dt:
+                        raise ValueError("resolve_datetime was not called — iso_datetime is None")
+                    ics_path = save_ics(new_state, iso_dt)
                     session["ics_path"] = str(ics_path)
                     await tx("__ics_ready__")
                 except Exception as e:
