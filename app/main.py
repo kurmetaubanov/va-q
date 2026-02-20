@@ -291,9 +291,6 @@ def groq_dialogue(history: list, state: dict, user_msg: str) -> tuple[str, dict,
                 if args.get("iso_datetime"):
                     iso_datetime = args["iso_datetime"]
                     print(f"[TOOL] iso_datetime: {iso_datetime}")
-                if args.get("iso_datetime"):
-                    iso_datetime = args["iso_datetime"]
-                    print(f"[TOOL] iso_datetime: {iso_datetime}")
 
             elif name == "validate_datetime":
                 print(f"[TOOL] validate_datetime: {args}")
@@ -539,6 +536,9 @@ async def ws_endpoint(websocket: WebSocket):
                 await tx("__mic_ready__")
                 continue
             print(f"[REPLY] {reply}")
+
+            if iso_dt:
+                session["iso_datetime"] = iso_dt
 
             await tx(f"__agent__{reply}")
 
