@@ -56,10 +56,38 @@ def merge_state(old, updates):
     return new
 
 # ─────────────────────────────────────────
-# Tool definition
+# Tools
 # ─────────────────────────────────────────
 
 TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "flag_secondary_intent",
+            "description": (
+                "Call this when the user's message contains a secondary intent "
+                "that is not necessary for completing the scheduling task."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "intent_description": {
+                        "type": "string",
+                        "description": "Short description of the off-topic request, e.g. 'asked for Elixir LiveView code'"
+                    },
+                    "severity": {
+                        "type": "string",
+                        "enum": ["soft", "hard"],
+                        "description": (
+                            "soft = minor tangent, user still focused on scheduling. "
+                            "hard = user clearly wants something unrelated."
+                        )
+                    }
+                },
+                "required": ["intent_description", "severity"]
+            }
+        }
+    },
     {
         "type": "function",
         "function": {
@@ -111,7 +139,24 @@ TOOLS = [
 # System prompt
 # ─────────────────────────────────────────
 
-def build_system(state):
+def build_system(state, secondary_intent=None):
+    drift_instruction = ""
+    if secondary_intent:
+        desc = secondary_intent.get("intent_description", "")
+        severity = secondary_intent.get("severity", "soft")
+        if severity == "hard":
+            drift_instruction = f"""
+IMPORTANT: The user just asked something off-topic: "{desc}".
+Do NOT answer it. Briefly say you can only help with scheduling here,
+then redirect back to completing the booking.
+"""
+        else:
+            drift_instruction = f"""
+NOTE: The user's message contained a side request: "{desc}".
+Acknowledge it very briefly (one short clause), then refocus on scheduling.
+Do not provide the off-topic content.
+"""
+
     return f"""You are a friendly voice scheduling assistant.
 
 Current schedule state:
@@ -123,12 +168,11 @@ Rules:
 - Schedule only ONE meeting at a time.
 - If the user mentions multiple dates or times, ask them to choose ONE. Never assume.
 - Finalize only after the user explicitly confirms all details.
-- If the user goes off-topic, briefly acknowledge and guide back to scheduling.
-- Always call the update_schedule tool to reflect any new information extracted.
-- When all info is collected and confirmed, set schedule_finalized=true in the tool call
-  and respond with a natural closing sentence.
+- Always call update_schedule to reflect any new information extracted.
+- If off-topic content is detected, call flag_secondary_intent and do NOT answer it.
+- When all info is collected and confirmed, set schedule_finalized=true and close naturally.
 - Keep responses short and conversational.
-"""
+{drift_instruction}"""
 
 # ─────────────────────────────────────────
 # Core dialogue step
@@ -136,7 +180,11 @@ Rules:
 
 def dialogue_step(history, state, user_msg):
     """
-    Single LLM call with tool use.
+    Single LLM call with two tools:
+      - flag_secondary_intent  → detected off-topic content
+      - update_schedule        → extract scheduling fields
+
+    Both can be called in the same turn.
     Returns (reply_text, new_state, should_reset).
     """
 
@@ -156,36 +204,46 @@ def dialogue_step(history, state, user_msg):
 
     reply_text = message.content or ""
     new_state = state
+    secondary_intent = None
 
     # ── Process tool calls ──
     if message.tool_calls:
         for tool_call in message.tool_calls:
-            if tool_call.function.name == "update_schedule":
-                try:
-                    args = json.loads(tool_call.function.arguments)
-                    new_state = merge_state(state, args)
-                    print(f"\n[TOOL] update_schedule called: {args}")
-                    print(f"[STATE] {new_state}\n")
-                except json.JSONDecodeError as e:
-                    print(f"[TOOL ERROR] {e}")
+            name = tool_call.function.name
+            try:
+                args = json.loads(tool_call.function.arguments)
+            except json.JSONDecodeError as e:
+                print(f"[TOOL ERROR] {name}: {e}")
+                continue
 
-    # ── If model returned tool call but no text, ask for text ──
-    # (some models skip text when calling tools)
+            if name == "update_schedule":
+                new_state = merge_state(state, args)
+                print(f"\n[TOOL] update_schedule: {args}")
+                print(f"[STATE] {new_state}\n")
+
+            elif name == "flag_secondary_intent":
+                secondary_intent = args
+                print(f"\n[TOOL] flag_secondary_intent: {args}\n")
+
+    # ── If model returned tool calls but no text → request reply ──
+    # secondary_intent is injected into system prompt so model knows to block the drift
     if message.tool_calls and not reply_text:
+        tool_results = [
+            {
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": "ok"
+            }
+            for tc in message.tool_calls
+        ]
+
         followup = client.chat.completions.create(
             model=MODEL,
             messages=[
-                {"role": "system", "content": build_system(new_state)},
+                {"role": "system", "content": build_system(new_state, secondary_intent)},
                 *messages,
                 {"role": "assistant", "content": None, "tool_calls": message.tool_calls},
-                *[
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": "ok"
-                    }
-                    for tc in message.tool_calls
-                ],
+                *tool_results,
             ],
             temperature=0.5,
             max_tokens=256,
@@ -253,11 +311,11 @@ INDEX_HTML = """
 </style>
 </head>
 <body>
-<h2>🗓 Scheduling Agent</h2>
+<h2>&#128197; Scheduling Agent</h2>
 <div id="chat"></div>
 <button id="startBtn" onclick="startChat()">START</button>
 <br><br>
-<input id="msg" placeholder="Type a message…" />
+<input id="msg" placeholder="Type a message..." />
 <button onclick="send()">Send</button>
 
 <script>
@@ -282,7 +340,7 @@ ws.onopen = () => {
 ws.onmessage = ({ data }) => {
   if (data === "__show_start__") {
     startBtn.style.display = "inline-block";
-    addMsg("— conversation finished —", "system");
+    addMsg("--- conversation finished ---", "system");
     return;
   }
   addMsg("Agent: " + data, "agent");
