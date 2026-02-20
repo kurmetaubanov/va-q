@@ -170,7 +170,7 @@ Rules:
 - Finalize only after the user explicitly confirms all details.
 - Always call update_schedule to reflect any new information extracted.
 - If off-topic content is detected, call flag_secondary_intent and do NOT answer it.
-- When all info is collected and confirmed, set schedule_finalized=true and close naturally.
+- When all info is collected and confirmed, set schedule_finalized=true and respond with ONE short closing sentence. Do NOT ask if there is anything else you can help with. Do NOT invite further conversation.
 - Keep responses short and conversational.
 {drift_instruction}"""
 
