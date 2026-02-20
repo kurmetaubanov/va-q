@@ -713,7 +713,7 @@ function addMsg(text, cls) {
 }
 
 function connectWS() {
-  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
   ws.binaryType = "arraybuffer";
   ws.onopen  = () => { addMsg("connected", "system"); };
   ws.onclose = e => { addMsg("disconnected", "system"); };
