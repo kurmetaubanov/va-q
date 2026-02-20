@@ -101,7 +101,7 @@ TOOLS = [
         "function": {
             "name": "validate_datetime",
             "description": (
-                "Set is_past=true only if: "
+                "Set is_past=true if: "
                 "(1) the date is clearly before today, OR "
                 "(2) the date is today AND the time is also known AND that time has already passed. "
                 "Set is_past=false when the date is in the future."
