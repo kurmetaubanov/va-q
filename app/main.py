@@ -592,6 +592,7 @@ async def ws_endpoint(websocket: WebSocket):
             await transcript_q.put(full)
         else:
             await tx_debug(f"[STOP_REC] rec={flushed_id} empty — skipped")
+            await tx("__system__Couldn't recognize audio — please try again.")
             await tx("__mic_ready__")
 
     # ── start background tasks ────────────────────────────────
@@ -732,7 +733,8 @@ function connectWS() {
         if (!isRecording) micBtn.textContent = "🎤 Tap to record";
         return;
       }
-      if (data.startsWith("__debug__"))  { addMsg(data.slice(9), "system"); return; }
+      if (data.startsWith("__debug__"))  { return; }
+      if (data.startsWith("__system__")) { addMsg(data.slice(10), "system"); return; }
       if (data === "__ics_ready__") {
         const d = document.createElement("div"); d.className = "system";
         d.innerHTML = '&#128197; <a href="/download-ics" download>Download .ics</a>';
