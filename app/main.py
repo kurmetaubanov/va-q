@@ -183,7 +183,7 @@ def _build_system(state: dict, secondary_intent: dict | None = None, past_dateti
     if past_datetime:
         past_instruction = f"""
 IMPORTANT: The date/time the user provided is in the past: "{past_datetime}".
-Do NOT continue or finalyze. Tell the user this date/time has already passed and ask them to provide a future date and time.
+Do NOT finalize. Tell the user this date/time has already passed and ask them to provide a future date and time.
 """
 
     drift_instruction = ""
@@ -613,6 +613,17 @@ async def ws_endpoint(websocket: WebSocket):
                         await tx_debug("[START_REC] waiting for Deepgram...")
                         await dg_ready.wait()
                         await tx_debug("[START_REC] Deepgram ready")
+
+                    # Drain any stale chunks left from previous recording
+                    drained = 0
+                    while not audio_q.empty():
+                        try:
+                            audio_q.get_nowait()
+                            drained += 1
+                        except asyncio.QueueEmpty:
+                            break
+                    if drained:
+                        print(f"[START_REC] drained {drained} stale items from queue")
 
                     rec_id     += 1
                     rec_bufs[rec_id] = []
