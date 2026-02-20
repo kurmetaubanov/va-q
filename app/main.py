@@ -10,7 +10,10 @@ import os
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse
 from groq import Groq
+from pathlib import Path
+from fastapi.responses import FileResponse
 from starlette.websockets import WebSocketDisconnect
+from .calendar_export import save_ics
 
 # ─────────────────────────────────────────
 # Config
@@ -36,6 +39,8 @@ def empty_state():
 app_state = {
     "history": [],
     "state": empty_state(),
+    "ics_path": None,
+    "iso_datetime": None,
 }
 
 def is_finalized(state):
@@ -132,6 +137,27 @@ TOOLS = [
                 "required": ["schedule_finalized"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "resolve_datetime",
+            "description": (
+                "Call this when schedule_finalized becomes true. "
+                "Convert the natural language date and time from the schedule "
+                "into an ISO 8601 datetime string, using today's date as reference."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "iso_datetime": {
+                        "type": "string",
+                        "description": "Resolved datetime in ISO 8601 format, e.g. '2026-02-21T17:00:00'"
+                    }
+                },
+                "required": ["iso_datetime"]
+            }
+        }
     }
 ]
 
@@ -157,7 +183,11 @@ Acknowledge it very briefly (one short clause), then refocus on scheduling.
 Do not provide the off-topic content.
 """
 
+    from datetime import datetime as _dt
+    today = _dt.now().strftime("%A, %Y-%m-%d")
     return f"""You are a friendly voice scheduling assistant.
+
+Today is {today}.
 
 Current schedule state:
 {json.dumps(state, indent=2)}
@@ -224,6 +254,10 @@ def dialogue_step(history, state, user_msg):
             elif name == "flag_secondary_intent":
                 secondary_intent = args
                 print(f"\n[TOOL] flag_secondary_intent: {args}\n")
+
+            elif name == "resolve_datetime":
+                app_state["iso_datetime"] = args.get("iso_datetime")
+                print(f"\n[TOOL] resolve_datetime: {args}\n")
 
     # ── If model returned tool calls but no text → request reply ──
     # secondary_intent is injected into system prompt so model knows to block the drift
@@ -343,6 +377,14 @@ ws.onmessage = ({ data }) => {
     addMsg("--- conversation finished ---", "system");
     return;
   }
+  if (data === "__ics_ready__") {
+    const d = document.createElement("div");
+    d.className = "system";
+    d.innerHTML = '&#128197; <a href="/download-ics" download>Download calendar event (.ics)</a>';
+    chat.appendChild(d);
+    chat.scrollTop = chat.scrollHeight;
+    return;
+  }
   addMsg("Agent: " + data, "agent");
 };
 
@@ -377,6 +419,18 @@ def index():
 def debug():
     return app_state
 
+@app.get("/download-ics")
+def download_ics():
+    path = app_state.get("ics_path")
+    if not path or not Path(path).exists():
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="No .ics file available yet")
+    return FileResponse(
+        path,
+        media_type="text/calendar",
+        filename=Path(path).name,
+    )
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
@@ -402,6 +456,17 @@ async def ws_endpoint(ws: WebSocket):
             ]
 
             if should_reset:
+                # Generate .ics before resetting state
+                try:
+                    iso_dt = app_state.get("iso_datetime")
+                    if not iso_dt:
+                        raise ValueError("iso_datetime not resolved by LLM")
+                    ics_path = save_ics(new_state, iso_dt)
+                    app_state["ics_path"] = str(ics_path)
+                    print(f"[ICS] saved to {ics_path}")
+                    await ws.send_text(f"__ics_ready__")
+                except Exception as e:
+                    print(f"[ICS ERROR] {e}")
                 app_state["history"] = []
                 app_state["state"] = empty_state()
                 await ws.send_text(reply)
