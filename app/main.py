@@ -9,9 +9,9 @@ uvicorn app.main:app --reload
 import asyncio
 import json
 import os
-from datetime import datetime
 from pathlib import Path
 
+from datetime import datetime
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket
@@ -63,6 +63,7 @@ def is_finalized(state: dict) -> bool:
         and state.get("time")
     )
 
+
 # ─────────────────────────────────────────────────────────────
 # Groq tools
 # ─────────────────────────────────────────────────────────────
@@ -101,9 +102,12 @@ TOOLS = [
         "function": {
             "name": "validate_datetime",
             "description": (
+                "Call this every time date or time is updated — including when the user changes "
+                "a previously given date or time. Do not skip if validate_datetime was already "
+                "called earlier in the conversation. "
                 "Set is_past=true if: "
                 "(1) the date is clearly before today, OR "
-                "(2) the date is today AND the time is also known AND that time has already passed. "
+                "(2) the date is today AND the time has already passed. "
                 "Set is_past=false when the date is in the future."
             ),
             "parameters": {
@@ -156,14 +160,7 @@ TOOLS = [
                             "AND the user has explicitly confirmed the booking."
                         )
                     },
-                    "iso_datetime": {
-                        "anyOf": [{"type": "string"}, {"type": "null"}],
-                        "description": (
-                            "ISO 8601 datetime string (e.g. '2026-02-21T17:00:00'). "
-                            "Set this whenever both date and time are known. "
-                            "Use the current date and weekday from the system prompt as reference."
-                        )
-                    }
+
                 },
                 "required": ["schedule_finalized"]
             }
@@ -284,15 +281,14 @@ def groq_dialogue(history: list, state: dict, user_msg: str) -> tuple[str, dict,
                 new_state = merge_state(state, args)
                 print(f"[TOOL] update_schedule: {args}")
                 print(f"[STATE] {new_state}")
-                if args.get("iso_datetime"):
-                    iso_datetime = args["iso_datetime"]
-                    print(f"[TOOL] iso_datetime: {iso_datetime}")
 
             elif name == "validate_datetime":
                 print(f"[TOOL] validate_datetime: {args}")
                 if args.get("is_past"):
                     past_datetime = args.get("reason", "The specified date and time is in the past.")
                     print(f"[TOOL] past datetime detected: {past_datetime}")
+                    # Force reset finalized flag so ICS is never saved for past datetime
+                    new_state = {**new_state, "schedule_finalized": False}
 
             elif name == "flag_secondary_intent":
                 secondary_intent = args
@@ -455,7 +451,6 @@ async def ws_endpoint(websocket: WebSocket):
                                     await dg.send(json.dumps({"type": "Finalize"}))
                                     print("[DG] Finalize sent")
                                 elif t == "close":
-                                    dg_flushed.clear()   # mark: waiting for finals
                                     await dg.send(json.dumps({"type": "CloseStream"}))
                                     print("[DG] CloseStream sent")
                                     return  # triggers reconnect
@@ -532,9 +527,6 @@ async def ws_endpoint(websocket: WebSocket):
                 continue
             print(f"[REPLY] {reply}")
 
-            if iso_dt:
-                session["iso_datetime"] = iso_dt
-
             await tx(f"__agent__{reply}")
 
             if is_finalized(new_state):
@@ -565,16 +557,23 @@ async def ws_endpoint(websocket: WebSocket):
 
     async def flush_recording(flushed_id: int, elapsed: float):
         await tx_debug(f"[STOP_REC] rec={flushed_id} elapsed={elapsed:.2f}s — waiting for DG flush...")
-        # Clear BEFORE sending close so we don't catch the previous session's signal
-        dg_flushed.clear()
         await audio_q.put({"type": "finalize"})
+        # Clear flush signal AFTER queuing close but before Deepgram can respond
+        dg_flushed.clear()
         await audio_q.put({"type": "close"})
 
         # Wait for Deepgram to signal end of stream (Metadata or double empty final)
         try:
             await asyncio.wait_for(dg_flushed.wait(), timeout=6.0)
         except asyncio.TimeoutError:
-            print(f"[STOP_REC] rec={flushed_id} DG flush timeout — collecting anyway")
+            print(f"[STOP_REC] rec={flushed_id} DG flush timeout — waiting for reconnect...")
+            # DG may have crashed mid-session; wait for reconnect before collecting
+            try:
+                await asyncio.wait_for(dg_ready.wait(), timeout=5.0)
+                # Give receiver a moment to process any buffered finals after reconnect
+                await asyncio.sleep(0.3)
+            except asyncio.TimeoutError:
+                print(f"[STOP_REC] rec={flushed_id} DG reconnect timeout — collecting anyway")
 
         fragments = rec_bufs.pop(flushed_id, [])
         full      = " ".join(fragments).strip()
