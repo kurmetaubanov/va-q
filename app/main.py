@@ -1,8 +1,8 @@
 """
 Voice Scheduling Agent
-STT: Deepgram  |  LLM: Groq  |  TTS: ElevenLabs
+STT: Deepgram Flux  |  LLM: Groq  |  TTS: ElevenLabs
 
-pip install groq fastapi uvicorn websockets icalendar httpx python-dotenv
+pip install groq fastapi uvicorn websockets icalendar httpx python-dotenv deepgram-sdk
 uvicorn app.main:app --reload
 """
 
@@ -10,8 +10,8 @@ import asyncio
 import json
 import os
 from pathlib import Path
-
 from datetime import datetime
+
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket
@@ -34,10 +34,16 @@ MODEL              = "llama-3.3-70b-versatile"
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-DEEPGRAM_URL = (
-    "wss://api.deepgram.com/v1/listen"
-    "?model=nova-2&language=en-US&punctuate=true"
-    "&interim_results=true&endpointing=400"
+# Flux v2 endpoint — eot_threshold=0.7 (default, explicit for clarity)
+# StartOfTurn fires when user starts speaking → barge-in
+# EndOfTurn fires when Flux is ≥70% confident user finished → trigger LLM
+DEEPGRAM_FLUX_URL = (
+    "wss://api.deepgram.com/v2/listen"
+    "?model=flux-general-en"
+    "&encoding=linear16"
+    "&sample_rate=16000"
+    "&eot_threshold=0.7"
+    "&eot_timeout_ms=4000"
 )
 
 # ─────────────────────────────────────────────────────────────
@@ -65,7 +71,7 @@ def is_finalized(state: dict) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────
-# Groq tools
+# Groq tools (unchanged from va-q)
 # ─────────────────────────────────────────────────────────────
 
 TOOLS = [
@@ -175,8 +181,9 @@ TOOLS = [
     }
 ]
 
+
 # ─────────────────────────────────────────────────────────────
-# Pure sync functions — run via asyncio.to_thread, never block loop
+# LLM helpers (sync, run via asyncio.to_thread)
 # ─────────────────────────────────────────────────────────────
 
 def _build_system(state: dict, secondary_intent: dict | None = None, past_datetime: str | None = None) -> str:
@@ -232,7 +239,6 @@ Rules:
 
 
 def groq_initiate() -> str:
-    """Opening greeting. Sync — run in thread pool."""
     r = groq_client.chat.completions.create(
         model=MODEL,
         messages=[
@@ -254,10 +260,6 @@ def groq_initiate() -> str:
 
 
 def groq_dialogue(history: list, state: dict, user_msg: str) -> tuple[str, dict, str | None]:
-    """
-    One dialogue turn. Sync — run in thread pool.
-    Returns (reply_text, new_state, iso_datetime_or_None).
-    """
     messages = history + [{"role": "user", "content": user_msg}]
 
     response = groq_client.chat.completions.create(
@@ -297,7 +299,6 @@ def groq_dialogue(history: list, state: dict, user_msg: str) -> tuple[str, dict,
                 if args.get("is_past"):
                     past_datetime = args.get("reason", "The specified date and time is in the past.")
                     print(f"[TOOL] past datetime detected: {past_datetime}")
-                    # Force reset finalized flag so ICS is never saved for past datetime
                     new_state = {**new_state, "schedule_finalized": False}
 
             elif name == "flag_secondary_intent":
@@ -326,7 +327,7 @@ def groq_dialogue(history: list, state: dict, user_msg: str) -> tuple[str, dict,
 
 
 # ─────────────────────────────────────────────────────────────
-# Async TTS
+# TTS
 # ─────────────────────────────────────────────────────────────
 
 async def elevenlabs_tts(text: str) -> bytes:
@@ -393,16 +394,14 @@ async def ws_endpoint(websocket: WebSocket):
 
     await websocket.accept()
 
-    audio_q:      asyncio.Queue = asyncio.Queue()
+    # Queue: EndOfTurn transcripts → LLM processor
     transcript_q: asyncio.Queue = asyncio.Queue()
-    rec_bufs:     dict          = {}   # rec_id -> [fragment, ...]
 
-    rec_id      = 0
-    rec_active  = False
-    rec_started = 0.0
+    # Audio queue: raw PCM chunks from browser → Deepgram
+    audio_q: asyncio.Queue = asyncio.Queue()
 
-    dg_ready    = asyncio.Event()   # Deepgram connected and ready
-    dg_flushed  = asyncio.Event()   # Deepgram finished flushing finals after CloseStream
+    # Flag: is agent currently playing TTS audio in browser?
+    agent_speaking = asyncio.Event()
 
     # ── send helpers ─────────────────────────────────────────
 
@@ -413,113 +412,121 @@ async def ws_endpoint(websocket: WebSocket):
         except Exception:
             pass
 
-    async def tx_debug(msg: str):
-        print(msg)
-        await tx(f"__debug__{msg}")
-
     async def speak(text: str):
+        """Send TTS audio to browser, set/clear agent_speaking around it."""
         try:
             mp3 = await elevenlabs_tts(text)
             if websocket.client_state == WebSocketState.CONNECTED:
+                agent_speaking.set()
                 await websocket.send_bytes(mp3)
+                # agent_speaking cleared when browser sends __audio_done__
         except Exception as e:
             print(f"[TTS ERROR] {e}")
+            agent_speaking.clear()
 
-    # ── Deepgram background task ──────────────────────────────
+    # ── Deepgram Flux background task ────────────────────────
 
     async def deepgram_task():
-        nonlocal rec_id
+        """
+        Maintains a persistent Deepgram Flux WebSocket.
+        Events handled:
+          - StartOfTurn  → user started speaking → interrupt agent TTS
+          - EndOfTurn    → user finished turn    → push transcript to LLM queue
+          - Update       → interim transcript    → show in UI
+        """
         while True:
             try:
                 async with wsl.connect(
-                    DEEPGRAM_URL,
+                    DEEPGRAM_FLUX_URL,
                     additional_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
                     ping_interval=None,
                 ) as dg:
-                    print("[DG] connected")
-                    dg_ready.set()
-                    dg_flushed.set()   # no pending flush at start
+                    print("[FLUX] connected")
 
                     async def sender():
+                        """Forward mic audio from browser to Deepgram."""
                         while True:
-                            try:
-                                item = await asyncio.wait_for(audio_q.get(), timeout=5.0)
-                            except asyncio.TimeoutError:
-                                try:
-                                    await dg.send(json.dumps({"type": "KeepAlive"}))
-                                    print("[DG] KeepAlive")
-                                except Exception as e:
-                                    print(f"[DG] KeepAlive fail: {e}")
-                                    return
-                                continue
-
-                            if item is None:
+                            chunk = await audio_q.get()
+                            if chunk is None:
                                 return
-                            if isinstance(item, dict):
-                                t = item["type"]
-                                if t == "finalize":
-                                    await dg.send(json.dumps({"type": "Finalize"}))
-                                    print("[DG] Finalize sent")
-                                elif t == "close":
-                                    await dg.send(json.dumps({"type": "CloseStream"}))
-                                    print("[DG] CloseStream sent")
-                                    return  # triggers reconnect
-                            else:
-                                await dg.send(item)
-                                print(f"[DG] audio {len(item)}b")
+                            try:
+                                await dg.send(chunk)
+                            except Exception as e:
+                                print(f"[FLUX] send error: {e}")
+                                return
 
                     async def receiver():
-                        last_final_was_empty = False
+                        """
+                        Parse Deepgram Flux TurnInfo messages.
+
+                        TurnInfo shape:
+                        {
+                          "type": "TurnInfo",
+                          "event": "StartOfTurn" | "EndOfTurn" | "Update" | "EagerEndOfTurn" | "TurnResumed",
+                          "transcript": "...",
+                          "end_of_turn_confidence": 0.86,
+                          "turn_index": 0
+                        }
+                        """
                         async for raw in dg:
                             try:
-                                data       = json.loads(raw)
-                                msg_type   = data.get("type", "")
-                                alt        = data.get("channel", {}).get("alternatives", [{}])[0]
-                                transcript = alt.get("transcript", "")
-                                is_final   = data.get("is_final", False)
-                                speech_final = data.get("speech_final", False)
-                                print(f"[DG←] final={is_final} speech_final={speech_final} '{transcript[:60]}'")
+                                data = json.loads(raw)
+                            except Exception:
+                                continue
 
-                                if transcript and is_final:
-                                    cur = rec_id
-                                    rec_bufs.setdefault(cur, []).append(transcript)
-                                    print(f"[DG] rec={cur} added: '{transcript}'")
-                                    last_final_was_empty = False
+                            msg_type = data.get("type", "")
 
-                                # Deepgram signals end of stream with empty final + speech_final
-                                if is_final and not transcript:
-                                    if last_final_was_empty:
-                                        # two empty finals = stream fully flushed
-                                        dg_flushed.set()
-                                        print("[DG] stream flushed")
-                                    last_final_was_empty = True
+                            # ── TurnInfo is the main event type from Flux ──
+                            if msg_type == "TurnInfo":
+                                event      = data.get("event", "")
+                                transcript = data.get("transcript", "").strip()
+                                confidence = data.get("end_of_turn_confidence", 0.0)
 
-                                if msg_type == "Metadata":
-                                    dg_flushed.set()
-                                    print("[DG] Metadata received — flushed")
+                                print(f"[FLUX] {event} conf={confidence:.2f} '{transcript[:60]}'")
 
-                            except Exception as e:
-                                print(f"[DG PARSE] {e}")
+                                if event == "StartOfTurn":
+                                    # User started speaking → interrupt agent if playing
+                                    if agent_speaking.is_set():
+                                        agent_speaking.clear()
+                                        await tx("__interrupt__")
+                                        print("[FLUX] barge-in → __interrupt__")
+                                    await tx("__user_started__")
+
+                                elif event == "Update":
+                                    # Interim transcript — show live in UI
+                                    if transcript:
+                                        await tx(f"__interim__{transcript}")
+
+                                elif event == "EndOfTurn":
+                                    # High-confidence turn complete (≥0.7 by config)
+                                    if transcript:
+                                        await tx(f"__user__{transcript}")
+                                        await transcript_q.put(transcript)
+                                    else:
+                                        print("[FLUX] EndOfTurn with empty transcript — ignored")
+
+                                # EagerEndOfTurn / TurnResumed — not used (no eager_eot_threshold set)
+
+                            elif msg_type == "Error":
+                                print(f"[FLUX] error: {data}")
 
                     await asyncio.gather(sender(), receiver())
-                    print("[DG] session done — reconnecting")
+                    print("[FLUX] session ended — reconnecting")
 
             except Exception as e:
-                print(f"[DG ERROR] {e} — retry 1s")
+                print(f"[FLUX ERROR] {e} — retry 1s")
                 await asyncio.sleep(1)
-            finally:
-                dg_ready.clear()
 
     # ── LLM processor ────────────────────────────────────────
 
     async def transcript_processor():
+        """Consumes EndOfTurn transcripts → Groq → ElevenLabs → browser."""
         while True:
             transcript = await transcript_q.get()
             if not transcript.strip():
                 continue
 
-            print(f"[TRANSCRIPT] {transcript}")
-            await tx(f"__user__{transcript}")
+            print(f"[LLM] processing: '{transcript}'")
 
             hist  = session["history"]
             state = session["state"]
@@ -533,9 +540,9 @@ async def ws_endpoint(websocket: WebSocket):
                 print(f"[LLM ERROR] {e}")
                 traceback.print_exc()
                 await tx("__agent__Sorry, I had an error. Please try again.")
-                await tx("__mic_ready__")
                 continue
-            print(f"[REPLY] {reply}")
+
+            print(f"[LLM] reply: '{reply}'")
 
             if iso_dt:
                 session["iso_datetime"] = iso_dt
@@ -561,39 +568,6 @@ async def ws_endpoint(websocket: WebSocket):
                 ]
                 session["state"] = new_state
                 await speak(reply)
-                # __mic_ready__ is sent by browser after audio.onended
-
-    # ── flush after stop_rec (fire-and-forget task) ───────────
-
-    async def flush_recording(flushed_id: int, elapsed: float):
-        await tx_debug(f"[STOP_REC] rec={flushed_id} elapsed={elapsed:.2f}s — waiting for DG flush...")
-        await audio_q.put({"type": "finalize"})
-        # Clear flush signal AFTER queuing close but before Deepgram can respond
-        dg_flushed.clear()
-        await audio_q.put({"type": "close"})
-
-        # Wait for Deepgram to signal end of stream (Metadata or double empty final)
-        try:
-            await asyncio.wait_for(dg_flushed.wait(), timeout=6.0)
-        except asyncio.TimeoutError:
-            print(f"[STOP_REC] rec={flushed_id} DG flush timeout — waiting for reconnect...")
-            # DG may have crashed mid-session; wait for reconnect before collecting
-            try:
-                await asyncio.wait_for(dg_ready.wait(), timeout=5.0)
-                # Give receiver a moment to process any buffered finals after reconnect
-                await asyncio.sleep(0.3)
-            except asyncio.TimeoutError:
-                print(f"[STOP_REC] rec={flushed_id} DG reconnect timeout — collecting anyway")
-
-        fragments = rec_bufs.pop(flushed_id, [])
-        full      = " ".join(fragments).strip()
-        await tx_debug(f"[STOP_REC] rec={flushed_id} → '{full}'")
-        if full:
-            await transcript_q.put(full)
-        else:
-            await tx_debug(f"[STOP_REC] rec={flushed_id} empty — skipped")
-            await tx("__system__Couldn't recognize audio — please try again.")
-            await tx("__mic_ready__")
 
     # ── start background tasks ────────────────────────────────
 
@@ -610,49 +584,22 @@ async def ws_endpoint(websocket: WebSocket):
                 cmd = msg["text"]
 
                 if cmd == "__start__":
+                    # Reset session and send greeting
                     session.update(history=[], state=empty_state(), iso_datetime=None)
                     greeting = await asyncio.to_thread(groq_initiate)
                     session["history"] = [{"role": "assistant", "content": greeting}]
                     await tx(f"__agent__{greeting}")
                     await speak(greeting)
-                    # __mic_ready__ sent by browser after audio.onended
 
-                elif cmd == "__start_rec__":
-                    # Block until DG is ready — no timeout guessing
-                    if not dg_ready.is_set():
-                        await tx_debug("[START_REC] waiting for Deepgram...")
-                        await dg_ready.wait()
-                        await tx_debug("[START_REC] Deepgram ready")
-
-                    # Drain any stale chunks left from previous recording
-                    drained = 0
-                    while not audio_q.empty():
-                        try:
-                            audio_q.get_nowait()
-                            drained += 1
-                        except asyncio.QueueEmpty:
-                            break
-                    if drained:
-                        print(f"[START_REC] drained {drained} stale items from queue")
-
-                    rec_id     += 1
-                    rec_bufs[rec_id] = []
-                    rec_active  = True
-                    rec_started = asyncio.get_running_loop().time()
-                    await tx_debug(f"[START_REC] rec={rec_id}")
-
-                elif cmd == "__stop_rec__":
-                    rec_active = False
-                    elapsed    = asyncio.get_running_loop().time() - rec_started
-                    asyncio.create_task(flush_recording(rec_id, elapsed))
+                elif cmd == "__audio_done__":
+                    # Browser finished playing agent audio → clear speaking flag
+                    agent_speaking.clear()
+                    print("[WS] agent audio done")
 
             elif "bytes" in msg:
+                # Raw PCM from browser mic → forward to Deepgram Flux
                 chunk = msg["bytes"]
-                if not rec_active:
-                    continue
-                print(f"[WS→DG] rec={rec_id} {len(chunk)}b q={audio_q.qsize()}")
-                if dg_ready.is_set():
-                    await audio_q.put(chunk)
+                await audio_q.put(chunk)
 
     except WebSocketDisconnect:
         print("[WS] disconnected")
@@ -661,7 +608,7 @@ async def ws_endpoint(websocket: WebSocket):
     finally:
         dg_task.cancel()
         llm_task.cancel()
-        await audio_q.put(None)
+        await audio_q.put(None)  # unblock sender
 
 
 # ─────────────────────────────────────────────────────────────
@@ -681,16 +628,18 @@ INDEX_HTML = """<!DOCTYPE html>
   h2 { text-align: center; margin-bottom: 20px; color: #222; }
   #chat { background: #fff; border: 1px solid #ddd; border-radius: 10px;
           padding: 16px; height: 380px; overflow-y: auto; margin-bottom: 20px; }
-  .user   { color: #222; margin: 6px 0; }
-  .agent  { color: #0b5cff; margin: 6px 0; }
-  .system { color: #999; font-size: 12px; margin: 4px 0; }
+  .user    { color: #222; margin: 6px 0; }
+  .interim { color: #aaa; font-style: italic; margin: 4px 0; font-size: 13px; }
+  .agent   { color: #0b5cff; margin: 6px 0; }
+  .system  { color: #999; font-size: 12px; margin: 4px 0; }
   #startBtn { display: block; width: 100%; padding: 14px; background: #28a745;
               color: #fff; border: none; border-radius: 8px; cursor: pointer;
               font-size: 16px; margin-bottom: 10px; }
-  #micBtn   { display: none; width: 100%; padding: 14px; background: #0b5cff;
-              color: #fff; border: none; border-radius: 8px; cursor: pointer;
-              font-size: 16px; }
-  #micBtn.recording { background: #dc3545; }
+  #statusBar { display: none; width: 100%; padding: 12px;
+               border-radius: 8px; font-size: 14px; text-align: center;
+               background: #e8f5e9; color: #2e7d32; border: 1px solid #a5d6a7; }
+  #statusBar.speaking { background: #e3f2fd; color: #1565c0; border-color: #90caf9; }
+  #statusBar.listening { background: #f3e5f5; color: #6a1b9a; border-color: #ce93d8; }
 </style>
 </head>
 <body>
@@ -698,114 +647,200 @@ INDEX_HTML = """<!DOCTYPE html>
   <h2>&#128197; Voice Scheduling Agent</h2>
   <div id="chat"></div>
   <button id="startBtn" onclick="startChat()">START</button>
-  <button id="micBtn"   onclick="toggleMic()">&#127908; Tap to record</button>
+  <div id="statusBar">🎙 Listening...</div>
 </div>
 <script>
-const chat     = document.getElementById("chat");
-const micBtn   = document.getElementById("micBtn");
-const startBtn = document.getElementById("startBtn");
-let ws, mediaRecorder, isRecording = false, recSeq = 0;
+const chat      = document.getElementById("chat");
+const startBtn  = document.getElementById("startBtn");
+const statusBar = document.getElementById("statusBar");
+
+let ws, mediaRecorder, currentAudio = null;
+let interimDiv = null;  // live interim transcript element
+let pendingStart = false;  // set if START clicked before WS open
 
 function addMsg(text, cls) {
+  // Remove stale interim div when a final message arrives
+  if (cls !== "interim" && interimDiv) {
+    interimDiv.remove();
+    interimDiv = null;
+  }
   const d = document.createElement("div");
-  d.className = cls; d.textContent = text;
-  chat.appendChild(d); chat.scrollTop = chat.scrollHeight;
+  d.className = cls;
+  d.textContent = text;
+  chat.appendChild(d);
+  chat.scrollTop = chat.scrollHeight;
+  if (cls === "interim") interimDiv = d;
+  return d;
+}
+
+function setStatus(text, cls = "") {
+  statusBar.textContent = text;
+  statusBar.className = cls;
+}
+
+function stopCurrentAudio() {
+  if (currentAudio) {
+    currentAudio.pause();
+    currentAudio.src = "";
+    currentAudio = null;
+  }
 }
 
 function connectWS() {
   ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
   ws.binaryType = "arraybuffer";
-  ws.onopen  = () => { addMsg("connected", "system"); };
-  ws.onclose = e => { addMsg("disconnected", "system"); };
-  ws.onerror = e => { addMsg("connection error", "system"); };
+
+  ws.onopen  = () => {
+    addMsg("connected", "system");
+    // If START was already clicked while WS was connecting, send now
+    if (pendingStart) {
+      pendingStart = false;
+      ws.send("__start__");
+    }
+  };
+  ws.onclose = () => addMsg("disconnected", "system");
+  ws.onerror = () => addMsg("connection error", "system");
 
   ws.onmessage = async ({ data }) => {
-    if (typeof data === "string") {
-      if (data === "__show_start__") {
-        startBtn.style.display = "block";
-        micBtn.style.display   = "none";
-        if (isRecording) stopRecording();
-        addMsg("--- done ---", "system");
-        return;
-      }
-      if (data === "__mic_ready__") {
-        micBtn.disabled = false;
-        if (!isRecording) micBtn.textContent = "🎤 Tap to record";
-        return;
-      }
-      if (data.startsWith("__debug__"))  { return; }
-      if (data.startsWith("__system__")) { addMsg(data.slice(10), "system"); return; }
-      if (data === "__ics_ready__") {
-        const d = document.createElement("div"); d.className = "system";
-        d.innerHTML = '&#128197; <a href="/download-ics" download>Download .ics</a>';
-        chat.appendChild(d); chat.scrollTop = chat.scrollHeight; return;
-      }
-      if (data.startsWith("__agent__")) { addMsg("Agent: " + data.slice(9), "agent"); return; }
-      if (data.startsWith("__user__"))  { addMsg("You: "  + data.slice(8),  "user");  return; }
-    }
+
+    // ── Binary: agent TTS audio ──────────────────────────
     if (data instanceof ArrayBuffer) {
-      micBtn.disabled = true;
-      micBtn.classList.remove("recording");
-      micBtn.textContent = "🔊 Agent speaking...";
-      const audio = new Audio(URL.createObjectURL(new Blob([data], { type: "audio/mpeg" })));
+      stopCurrentAudio();
+
+      const audio = new Audio(URL.createObjectURL(
+        new Blob([data], { type: "audio/mpeg" })
+      ));
+      currentAudio = audio;
+
       audio.onended = () => {
-        micBtn.disabled = false;
-        micBtn.textContent = "🎤 Tap to record";
+        currentAudio = null;
+        ws.send("__audio_done__");
+      };
+      audio.onerror = () => {
+        currentAudio = null;
+        ws.send("__audio_done__");
       };
       audio.play().catch(() => {
-        micBtn.disabled = false;
-        micBtn.textContent = "🎤 Tap to record";
+        currentAudio = null;
+        ws.send("__audio_done__");
       });
+      return;
+    }
+
+    // ── Text messages ────────────────────────────────────
+    if (typeof data !== "string") return;
+
+    if (data === "__interrupt__") {
+      // Flux detected barge-in → stop agent audio immediately
+      stopCurrentAudio();
+      ws.send("__audio_done__");
+      setStatus("🎙 Listening...", "listening");
+      return;
+    }
+
+    if (data === "__user_started__") {
+      // User started speaking — visual feedback
+      setStatus("🎙 Listening...", "listening");
+      return;
+    }
+
+    if (data.startsWith("__interim__")) {
+      // Live interim transcript
+      const text = data.slice(11);
+      if (interimDiv) {
+        interimDiv.textContent = "... " + text;
+      } else {
+        addMsg("... " + text, "interim");
+      }
+      return;
+    }
+
+    if (data.startsWith("__user__")) {
+      addMsg("You: " + data.slice(8), "user");
+      return;
+    }
+
+    if (data.startsWith("__agent__")) {
+      addMsg("Agent: " + data.slice(9), "agent");
+      setStatus("🎙 Listening...", "listening");
+      return;
+    }
+
+    if (data === "__show_start__") {
+      startBtn.style.display = "block";
+      statusBar.style.display = "none";
+      stopCurrentAudio();
+      addMsg("--- session complete ---", "system");
+      if (mediaRecorder && mediaRecorder.state !== "inactive") {
+        mediaRecorder.stop();
+        mediaRecorder.stream.getTracks().forEach(t => t.stop());
+        mediaRecorder = null;
+      }
+      return;
+    }
+
+    if (data === "__ics_ready__") {
+      const d = document.createElement("div");
+      d.className = "system";
+      d.innerHTML = '&#128197; <a href="/download-ics" download>Download .ics</a>';
+      chat.appendChild(d);
+      chat.scrollTop = chat.scrollHeight;
+      return;
+    }
+
+    if (data.startsWith("__system__")) {
+      addMsg(data.slice(10), "system");
+      return;
     }
   };
 }
 
-function startChat() {
-  startBtn.style.display = "none";
-  micBtn.style.display   = "block";
-  micBtn.disabled = true;
-  micBtn.textContent = "⏳ Loading...";
-  ws.send("__start__");
-}
-
-function toggleMic() { isRecording ? stopRecording() : startRecording(); }
-
-async function startRecording() {
+async function startMic() {
   try {
-    recSeq++;
-    const stream   = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-                     ? "audio/webm;codecs=opus" : "audio/webm";
-    mediaRecorder  = new MediaRecorder(stream, { mimeType });
-    mediaRecorder.ondataavailable = e => {
-      if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) ws.send(e.data);
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true }
+    });
+
+    // Stream raw PCM linear16 via ScriptProcessor
+    // (MediaRecorder would give us opus/webm which Flux can accept containerised,
+    //  but we're already asking for linear16 in the Deepgram URL — use raw PCM)
+    const ctx       = new AudioContext({ sampleRate: 16000 });
+    const source    = ctx.createMediaStreamSource(stream);
+    const processor = ctx.createScriptProcessor(2048, 1, 1);  // ~128ms chunks @ 16kHz (must be power of 2)
+
+    processor.onaudioprocess = (e) => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      const f32 = e.inputBuffer.getChannelData(0);
+      const i16 = new Int16Array(f32.length);
+      for (let i = 0; i < f32.length; i++)
+        i16[i] = Math.max(-32768, Math.min(32767, f32[i] * 32768));
+      ws.send(i16.buffer);
     };
-    mediaRecorder.start(250);
-    ws.send("__start_rec__");
-    isRecording = true;
-    micBtn.disabled = false;
-    micBtn.textContent = "⏹ Stop recording";
-    micBtn.classList.add("recording");
-  } catch(e) { addMsg("Mic error: " + e.message, "system"); }
+
+    source.connect(processor);
+    processor.connect(ctx.destination);
+
+    // Store for cleanup
+    mediaRecorder = { ctx, processor, stream };
+
+  } catch(e) {
+    addMsg("Mic error: " + e.message, "system");
+  }
 }
 
-function stopRecording() {
-  isRecording = false;
-  micBtn.disabled = true;
-  micBtn.textContent = "⏳ Processing...";
-  micBtn.classList.remove("recording");
+async function startChat() {
+  startBtn.style.display  = "none";
+  statusBar.style.display = "block";
+  setStatus("⏳ Starting...");
 
-  if (mediaRecorder && mediaRecorder.state !== "inactive") {
-    mediaRecorder.onstop = () => {
-      ws.send("__stop_rec__");
-      mediaRecorder = null;
-      // mic stays disabled until __mic_ready__ from server
-    };
-    mediaRecorder.stop();
-    mediaRecorder.stream.getTracks().forEach(t => t.stop());
+  // Start mic first — browser needs user gesture to get mic access
+  await startMic();
+
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send("__start__");
   } else {
-    ws.send("__stop_rec__");
-    mediaRecorder = null;
+    // WS not ready yet — send once onopen fires
+    pendingStart = true;
   }
 }
 
