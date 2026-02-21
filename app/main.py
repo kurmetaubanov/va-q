@@ -43,7 +43,7 @@ DEEPGRAM_FLUX_URL = (
     "&encoding=linear16"
     "&sample_rate=16000"
     "&eot_threshold=0.7"
-    "&eot_timeout_ms=4000"
+    "&eot_timeout_ms=2000"
 )
 
 # ─────────────────────────────────────────────────────────────
@@ -483,7 +483,7 @@ async def ws_endpoint(websocket: WebSocket):
                                 transcript = data.get("transcript", "").strip()
                                 confidence = data.get("end_of_turn_confidence", 0.0)
 
-                                print(f"[FLUX] {event} conf={confidence:.2f} '{transcript[:60]}'")
+                                print(f"[FLUX] {event} conf={confidence:.2f} '{transcript}'")
 
                                 if event == "StartOfTurn":
                                     # User started speaking → interrupt agent if playing
