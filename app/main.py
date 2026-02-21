@@ -169,9 +169,10 @@ TOOLS = [
                     "iso_datetime": {
                         "anyOf": [{"type": "string"}, {"type": "null"}],
                         "description": (
-                            "ISO 8601 datetime string e.g. '2026-02-27T05:00:00'. "
-                            "Set this whenever both date and time are known. "
-                            "MUST be non-null when schedule_finalized=true."
+                            "ISO 8601 datetime string (local time) e.g. '2026-02-27T17:00:00'. "
+                            "You MUST compute and return this value whenever date and time are known. "
+                            "If the user says a weekday (e.g. Monday), resolve it to the nearest future date. "
+                            "schedule_finalized MUST NEVER be true if iso_datetime is null."
                         )
                     }
                 },
