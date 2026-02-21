@@ -440,7 +440,8 @@ async def ws_endpoint(websocket: WebSocket):
                 async with wsl.connect(
                     DEEPGRAM_FLUX_URL,
                     additional_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
-                    ping_interval=None,
+                    ping_interval=20,
+                    ping_timeout=20,
                 ) as dg:
                     print("[FLUX] connected")
 
