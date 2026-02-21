@@ -639,9 +639,7 @@ INDEX_HTML = """<!DOCTYPE html>
                border-radius: 8px; font-size: 14px; text-align: center;
                background: #e8f5e9; color: #2e7d32; border: 1px solid #a5d6a7; }
   #statusBar.speaking { background: #e3f2fd; color: #1565c0; border-color: #90caf9; }
-  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
-  #listeningBadge { display:none; text-align:center; color:#6a1b9a;
-                    font-size:14px; animation: blink 1.2s infinite; margin-bottom:8px; }
+  #statusBar.listening { background: #f3e5f5; color: #6a1b9a; border-color: #ce93d8; }
 </style>
 </head>
 <body>
@@ -649,14 +647,12 @@ INDEX_HTML = """<!DOCTYPE html>
   <h2>&#128197; Voice Scheduling Agent</h2>
   <div id="chat"></div>
   <button id="startBtn" onclick="startChat()">START</button>
-  <div id="listeningBadge">🎙 Listening...</div>
-  <div id="statusBar"></div>
+  <div id="statusBar">🎙 Listening...</div>
 </div>
 <script>
 const chat      = document.getElementById("chat");
 const startBtn  = document.getElementById("startBtn");
 const statusBar = document.getElementById("statusBar");
-const listeningBadge = document.getElementById("listeningBadge");
 
 let ws, mediaRecorder, currentAudio = null;
 let interimDiv = null;  // live interim transcript element
@@ -678,15 +674,8 @@ function addMsg(text, cls) {
 }
 
 function setStatus(text, cls = "") {
-  listeningBadge.style.display = "none";
   statusBar.textContent = text;
   statusBar.className = cls;
-}
-
-function showListening() {
-  listeningBadge.style.display = "block";
-  statusBar.textContent = "";
-  statusBar.className = "";
 }
 
 function stopCurrentAudio() {
@@ -745,13 +734,13 @@ function connectWS() {
       // Flux detected barge-in → stop agent audio immediately
       stopCurrentAudio();
       ws.send("__audio_done__");
-      showListening();
+      setStatus("🎙 Listening...", "listening");
       return;
     }
 
     if (data === "__user_started__") {
       // User started speaking — visual feedback
-      showListening();
+      setStatus("🎙 Listening...", "listening");
       return;
     }
 
@@ -773,14 +762,13 @@ function connectWS() {
 
     if (data.startsWith("__agent__")) {
       addMsg("Agent: " + data.slice(9), "agent");
-      showListening();
+      setStatus("🎙 Listening...", "listening");
       return;
     }
 
     if (data === "__show_start__") {
       startBtn.style.display = "block";
       statusBar.style.display = "none";
-      listeningBadge.style.display = "none";
       stopCurrentAudio();
       addMsg("--- session complete ---", "system");
       if (mediaRecorder && mediaRecorder.state !== "inactive") {
