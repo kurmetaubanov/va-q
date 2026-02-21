@@ -559,9 +559,8 @@ async def ws_endpoint(websocket: WebSocket):
                 session["history"]      = []
                 session["state"]        = empty_state()
                 session["iso_datetime"] = None
-                # __finalized__ tells browser: stop mic, play this audio, then show START
-                await tx("__finalized__")
                 await speak(reply)
+                await tx("__show_start__")
             else:
                 session["history"] = hist + [
                     {"role": "user",      "content": transcript},
@@ -597,12 +596,6 @@ async def ws_endpoint(websocket: WebSocket):
                     agent_speaking.clear()
                     print("[WS] agent audio done")
 
-                elif cmd == "__stop__":
-                    # Emergency stop — reset session
-                    session.update(history=[], state=empty_state(), iso_datetime=None)
-                    agent_speaking.clear()
-                    print("[WS] session stopped by user")
-
             elif "bytes" in msg:
                 # Raw PCM from browser mic → forward to Deepgram Flux
                 chunk = msg["bytes"]
@@ -634,78 +627,39 @@ INDEX_HTML = """<!DOCTYPE html>
   .container { width: 100%; max-width: 480px; }
   h2 { text-align: center; margin-bottom: 20px; color: #222; }
   #chat { background: #fff; border: 1px solid #ddd; border-radius: 10px;
-          padding: 16px; height: 380px; overflow-y: auto; margin-bottom: 16px; }
+          padding: 16px; height: 380px; overflow-y: auto; margin-bottom: 20px; }
   .user    { color: #222; margin: 6px 0; }
   .interim { color: #aaa; font-style: italic; margin: 4px 0; font-size: 13px; }
   .agent   { color: #0b5cff; margin: 6px 0; }
   .system  { color: #999; font-size: 12px; margin: 4px 0; }
-
-  /* Controls row: indicator left, button right */
-  .controls {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-  }
-
-  /* Listening indicator — always visible during session */
-  #indicator {
-    display: none;          /* hidden before session starts */
-    align-items: center;
-    gap: 8px;
-    flex: 1;
-    font-size: 13px;
-    color: #555;
-  }
-  #indicator .dot {
-    width: 10px; height: 10px;
-    border-radius: 50%;
-    background: #4caf50;
-    flex-shrink: 0;
-    animation: pulse 1.4s ease-in-out infinite;
-  }
-  @keyframes pulse {
-    0%, 100% { opacity: 1; transform: scale(1); }
-    50%       { opacity: 0.4; transform: scale(0.8); }
-  }
-
-  /* START / STOP button */
-  #mainBtn {
-    padding: 12px 24px;
-    border: none; border-radius: 8px;
-    cursor: pointer; font-size: 15px; font-weight: 600;
-    transition: background 0.2s;
-    white-space: nowrap;
-  }
-  #mainBtn.start { background: #28a745; color: #fff; width: 100%; }
-  #mainBtn.stop  { background: #dc3545; color: #fff; }
+  #startBtn { display: block; width: 100%; padding: 14px; background: #28a745;
+              color: #fff; border: none; border-radius: 8px; cursor: pointer;
+              font-size: 16px; margin-bottom: 10px; }
+  #statusBar { display: none; width: 100%; padding: 12px;
+               border-radius: 8px; font-size: 14px; text-align: center;
+               background: #e8f5e9; color: #2e7d32; border: 1px solid #a5d6a7; }
+  #statusBar.speaking { background: #e3f2fd; color: #1565c0; border-color: #90caf9; }
+  #statusBar.listening { background: #f3e5f5; color: #6a1b9a; border-color: #ce93d8; }
 </style>
 </head>
 <body>
 <div class="container">
   <h2>&#128197; Voice Scheduling Agent</h2>
   <div id="chat"></div>
-
-  <div class="controls">
-    <div id="indicator">
-      <div class="dot"></div>
-      <span id="indicatorText">Listening...</span>
-    </div>
-    <button id="mainBtn" class="start" onclick="handleBtn()">START</button>
-  </div>
+  <button id="startBtn" onclick="startChat()">START</button>
+  <div id="statusBar">🎙 Listening...</div>
 </div>
 <script>
-const chat          = document.getElementById("chat");
-const mainBtn       = document.getElementById("mainBtn");
-const indicator     = document.getElementById("indicator");
-const indicatorText = document.getElementById("indicatorText");
+const chat      = document.getElementById("chat");
+const startBtn  = document.getElementById("startBtn");
+const statusBar = document.getElementById("statusBar");
 
-let ws, micState = null, currentAudio = null;
-let interimDiv = null;
-let pendingStart = false;
-let sessionActive = false;
-let finalizing = false;   // true after __finalized__, mic stops, waiting for audio to end
+let ws, mediaRecorder, currentAudio = null;
+let interimDiv = null;  // live interim transcript element
+let pendingStart = false;  // set if START clicked before WS open
 
 function addMsg(text, cls) {
+  // Remove stale interim div when a final message arrives
   if (cls !== "interim" && interimDiv) {
     interimDiv.remove();
     interimDiv = null;
@@ -719,8 +673,9 @@ function addMsg(text, cls) {
   return d;
 }
 
-function setIndicator(text) {
-  indicatorText.textContent = text;
+function setStatus(text, cls = "") {
+  statusBar.textContent = text;
+  statusBar.className = cls;
 }
 
 function stopCurrentAudio() {
@@ -731,64 +686,19 @@ function stopCurrentAudio() {
   }
 }
 
-function stopMic() {
-  if (micState) {
-    micState.processor.disconnect();
-    micState.source.disconnect();
-    micState.stream.getTracks().forEach(t => t.stop());
-    micState.ctx.close();
-    micState = null;
-  }
-}
-
-function showStartBtn() {
-  sessionActive = false;
-  finalizing = false;
-  indicator.style.display = "none";
-  mainBtn.className = "start";
-  mainBtn.style.width = "100%";
-  mainBtn.textContent = "START";
-}
-
-function showSessionControls() {
-  sessionActive = true;
-  indicator.style.display = "flex";
-  mainBtn.className = "stop";
-  mainBtn.style.width = "";
-  mainBtn.textContent = "STOP";
-}
-
-function handleBtn() {
-  if (!sessionActive) {
-    startChat();
-  } else {
-    emergencyStop();
-  }
-}
-
-function emergencyStop() {
-  stopCurrentAudio();
-  stopMic();
-  if (ws && ws.readyState === WebSocket.OPEN) ws.send("__stop__");
-  showStartBtn();
-  addMsg("--- stopped ---", "system");
-}
-
 function connectWS() {
   ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
   ws.binaryType = "arraybuffer";
 
-  ws.onopen = () => {
+  ws.onopen  = () => {
     addMsg("connected", "system");
+    // If START was already clicked while WS was connecting, send now
     if (pendingStart) {
       pendingStart = false;
       ws.send("__start__");
     }
   };
-  ws.onclose = () => {
-    addMsg("disconnected", "system");
-    if (sessionActive) showStartBtn();
-  };
+  ws.onclose = () => addMsg("disconnected", "system");
   ws.onerror = () => addMsg("connection error", "system");
 
   ws.onmessage = async ({ data }) => {
@@ -796,30 +706,24 @@ function connectWS() {
     // ── Binary: agent TTS audio ──────────────────────────
     if (data instanceof ArrayBuffer) {
       stopCurrentAudio();
-      setIndicator("Agent speaking...");
 
       const audio = new Audio(URL.createObjectURL(
         new Blob([data], { type: "audio/mpeg" })
       ));
       currentAudio = audio;
 
-      const onDone = () => {
+      audio.onended = () => {
         currentAudio = null;
-        if (finalizing) {
-          // Last phrase played — now show START
-          stopMic();
-          showStartBtn();
-          addMsg("--- session complete ---", "system");
-          ws.send("__audio_done__");
-        } else {
-          ws.send("__audio_done__");
-          setIndicator("Listening...");
-        }
+        ws.send("__audio_done__");
       };
-
-      audio.onended = onDone;
-      audio.onerror = onDone;
-      audio.play().catch(onDone);
+      audio.onerror = () => {
+        currentAudio = null;
+        ws.send("__audio_done__");
+      };
+      audio.play().catch(() => {
+        currentAudio = null;
+        ws.send("__audio_done__");
+      });
       return;
     }
 
@@ -827,21 +731,21 @@ function connectWS() {
     if (typeof data !== "string") return;
 
     if (data === "__interrupt__") {
-      if (!finalizing) {
-        stopCurrentAudio();
-        ws.send("__audio_done__");
-        setIndicator("Listening...");
-      }
+      // Flux detected barge-in → stop agent audio immediately
+      stopCurrentAudio();
+      ws.send("__audio_done__");
+      setStatus("🎙 Listening...", "listening");
       return;
     }
 
     if (data === "__user_started__") {
-      if (!finalizing) setIndicator("Listening...");
+      // User started speaking — visual feedback
+      setStatus("🎙 Listening...", "listening");
       return;
     }
 
     if (data.startsWith("__interim__")) {
-      if (finalizing) return;
+      // Live interim transcript
       const text = data.slice(11);
       if (interimDiv) {
         interimDiv.textContent = "... " + text;
@@ -858,14 +762,20 @@ function connectWS() {
 
     if (data.startsWith("__agent__")) {
       addMsg("Agent: " + data.slice(9), "agent");
-      if (!finalizing) setIndicator("Listening...");
+      setStatus("🎙 Listening...", "listening");
       return;
     }
 
-    if (data === "__finalized__") {
-      // Session done — stop sending mic audio, wait for TTS to finish
-      finalizing = true;
-      setIndicator("Finishing...");
+    if (data === "__show_start__") {
+      startBtn.style.display = "block";
+      statusBar.style.display = "none";
+      stopCurrentAudio();
+      addMsg("--- session complete ---", "system");
+      if (mediaRecorder && mediaRecorder.state !== "inactive") {
+        mediaRecorder.stop();
+        mediaRecorder.stream.getTracks().forEach(t => t.stop());
+        mediaRecorder = null;
+      }
       return;
     }
 
@@ -890,12 +800,15 @@ async function startMic() {
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true }
     });
+
+    // Stream raw PCM linear16 via ScriptProcessor
+    // (MediaRecorder would give us opus/webm which Flux can accept containerised,
+    //  but we're already asking for linear16 in the Deepgram URL — use raw PCM)
     const ctx       = new AudioContext({ sampleRate: 16000 });
     const source    = ctx.createMediaStreamSource(stream);
-    const processor = ctx.createScriptProcessor(2048, 1, 1);
+    const processor = ctx.createScriptProcessor(2048, 1, 1);  // ~128ms chunks @ 16kHz (must be power of 2)
 
     processor.onaudioprocess = (e) => {
-      if (finalizing) return;   // don't send audio during finalization
       if (ws.readyState !== WebSocket.OPEN) return;
       const f32 = e.inputBuffer.getChannelData(0);
       const i16 = new Int16Array(f32.length);
@@ -906,20 +819,27 @@ async function startMic() {
 
     source.connect(processor);
     processor.connect(ctx.destination);
-    micState = { ctx, source, processor, stream };
+
+    // Store for cleanup
+    mediaRecorder = { ctx, processor, stream };
+
   } catch(e) {
     addMsg("Mic error: " + e.message, "system");
   }
 }
 
 async function startChat() {
-  showSessionControls();
-  setIndicator("Starting...");
+  startBtn.style.display  = "none";
+  statusBar.style.display = "block";
+  setStatus("⏳ Starting...");
+
+  // Start mic first — browser needs user gesture to get mic access
   await startMic();
 
   if (ws.readyState === WebSocket.OPEN) {
     ws.send("__start__");
   } else {
+    // WS not ready yet — send once onopen fires
     pendingStart = true;
   }
 }
