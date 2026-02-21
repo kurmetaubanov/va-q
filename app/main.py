@@ -632,37 +632,89 @@ INDEX_HTML = """<!DOCTYPE html>
   .interim { color: #aaa; font-style: italic; margin: 4px 0; font-size: 13px; }
   .agent   { color: #0b5cff; margin: 6px 0; }
   .system  { color: #999; font-size: 12px; margin: 4px 0; }
-  #startBtn { display: block; width: 100%; padding: 14px; background: #28a745;
-              color: #fff; border: none; border-radius: 8px; cursor: pointer;
-              font-size: 16px; margin-bottom: 10px; }
-  #statusBar { display: none; width: 100%; padding: 12px;
-               border-radius: 8px; font-size: 14px; text-align: center;
-               background: #e8f5e9; color: #2e7d32; border: 1px solid #a5d6a7; }
+
+  /* START button */
+  #startBtn {
+    display: block;
+    width: 100%;
+    padding: 14px;
+    background: #28a745;
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 16px;
+    margin-bottom: 10px;
+  }
+
+  /* STOP button */
+  #stopBtn {
+    display: none;
+    width: 100%;
+    padding: 14px;
+    background: #dc3545;
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 16px;
+    margin-bottom: 10px;
+  }
+
+  #statusBar {
+    display: none;
+    width: 100%;
+    padding: 12px;
+    border-radius: 8px;
+    font-size: 14px;
+    text-align: center;
+    background: #e8f5e9;
+    color: #2e7d32;
+    border: 1px solid #a5d6a7;
+  }
+
   #statusBar.speaking { background: #e3f2fd; color: #1565c0; border-color: #90caf9; }
   #statusBar.listening { background: #f3e5f5; color: #6a1b9a; border-color: #ce93d8; }
-  #listeningIndicator { display: none; color: #28a745; font-size: 13px; margin-top: 6px; animation: blink 1s step-start infinite; }
+
+  #listeningIndicator {
+    display: none;
+    color: #28a745;
+    font-size: 13px;
+    margin: 12px 0 16px 0;   /* ↑ больше воздуха сверху и снизу */
+    animation: blink 1s step-start infinite;
+  }
+
   @keyframes blink { 50% { opacity: 0; } }
 </style>
 </head>
 <body>
 <div class="container">
   <h2>&#128197; Voice Scheduling Agent</h2>
+
   <div id="chat"></div>
+
   <div id="listeningIndicator">🟢 Listening...</div>
+
+  <!-- START button -->
   <button id="startBtn" onclick="startChat()">START</button>
+
+  <!-- STOP button (appears during active session) -->
+  <button id="stopBtn" onclick="stopChat()">STOP</button>
+
   <div id="statusBar">🎙 Listening...</div>
 </div>
+
 <script>
 const chat      = document.getElementById("chat");
 const startBtn  = document.getElementById("startBtn");
+const stopBtn   = document.getElementById("stopBtn");
 const statusBar = document.getElementById("statusBar");
 
 let ws, mediaRecorder, currentAudio = null;
-let interimDiv = null;  // live interim transcript element
-let pendingStart = false;  // set if START clicked before WS open
+let interimDiv = null;
+let pendingStart = false;
 
 function addMsg(text, cls) {
-  // Remove stale interim div when a final message arrives
   if (cls !== "interim" && interimDiv) {
     interimDiv.remove();
     interimDiv = null;
@@ -673,12 +725,6 @@ function addMsg(text, cls) {
   chat.appendChild(d);
   chat.scrollTop = chat.scrollHeight;
   if (cls === "interim") interimDiv = d;
-  return d;
-}
-
-function setStatus(text, cls = "") {
-  statusBar.textContent = text;
-  statusBar.className = cls;
 }
 
 function showListening(on) {
@@ -697,48 +743,32 @@ function connectWS() {
   ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
   ws.binaryType = "arraybuffer";
 
-  ws.onopen  = () => {
+  ws.onopen = () => {
     addMsg("connected", "system");
-    // If START was already clicked while WS was connecting, send now
     if (pendingStart) {
       pendingStart = false;
       ws.send("__start__");
     }
   };
+
   ws.onclose = () => addMsg("disconnected", "system");
   ws.onerror = () => addMsg("connection error", "system");
 
   ws.onmessage = async ({ data }) => {
 
-    // ── Binary: agent TTS audio ──────────────────────────
     if (data instanceof ArrayBuffer) {
       stopCurrentAudio();
-
       const audio = new Audio(URL.createObjectURL(
         new Blob([data], { type: "audio/mpeg" })
       ));
       currentAudio = audio;
-
-      audio.onended = () => {
-        currentAudio = null;
-        ws.send("__audio_done__");
-      };
-      audio.onerror = () => {
-        currentAudio = null;
-        ws.send("__audio_done__");
-      };
-      audio.play().catch(() => {
-        currentAudio = null;
-        ws.send("__audio_done__");
-      });
+      audio.onended = () => ws.send("__audio_done__");
+      audio.onerror = () => ws.send("__audio_done__");
+      audio.play().catch(() => ws.send("__audio_done__"));
       return;
     }
 
-    // ── Text messages ────────────────────────────────────
-    if (typeof data !== "string") return;
-
     if (data === "__interrupt__") {
-      // Flux detected barge-in → stop agent audio immediately
       stopCurrentAudio();
       ws.send("__audio_done__");
       showListening(true);
@@ -746,19 +776,14 @@ function connectWS() {
     }
 
     if (data === "__user_started__") {
-      // User started speaking — visual feedback
       showListening(true);
       return;
     }
 
     if (data.startsWith("__interim__")) {
-      // Live interim transcript
       const text = data.slice(11);
-      if (interimDiv) {
-        interimDiv.textContent = "... " + text;
-      } else {
-        addMsg("... " + text, "interim");
-      }
+      if (interimDiv) interimDiv.textContent = "... " + text;
+      else addMsg("... " + text, "interim");
       return;
     }
 
@@ -775,16 +800,24 @@ function connectWS() {
     }
 
     if (data === "__show_start__") {
-      startBtn.style.display = "block";
-      statusBar.style.display = "none";
-      showListening(false);
-      stopCurrentAudio();
-      addMsg("--- session complete ---", "system");
-      if (mediaRecorder && mediaRecorder.state !== "inactive") {
-        mediaRecorder.stop();
-        mediaRecorder.stream.getTracks().forEach(t => t.stop());
-        mediaRecorder = null;
+
+      // stop audio playback immediately
+      // stopCurrentAudio();
+
+      // STOP microphone streaming immediately
+      if (mediaRecorder) {
+          mediaRecorder.stream.getTracks().forEach(t => t.stop());
+          mediaRecorder.ctx.close();
+          mediaRecorder = null;
       }
+
+      showListening(false);
+
+      startBtn.style.display = "block";
+      stopBtn.style.display  = "none";
+   
+      addMsg("--- session complete ---", "system");
+
       return;
     }
 
@@ -793,66 +826,69 @@ function connectWS() {
       d.className = "system";
       d.innerHTML = '&#128197; <a href="/download-ics" download>Download .ics</a>';
       chat.appendChild(d);
-      chat.scrollTop = chat.scrollHeight;
-      return;
-    }
-
-    if (data.startsWith("__system__")) {
-      addMsg(data.slice(10), "system");
-      return;
     }
   };
 }
 
 async function startMic() {
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true }
-    });
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const ctx = new AudioContext({ sampleRate: 16000 });
+  const source = ctx.createMediaStreamSource(stream);
+  const processor = ctx.createScriptProcessor(2048, 1, 1);
 
-    // Stream raw PCM linear16 via ScriptProcessor
-    // (MediaRecorder would give us opus/webm which Flux can accept containerised,
-    //  but we're already asking for linear16 in the Deepgram URL — use raw PCM)
-    const ctx       = new AudioContext({ sampleRate: 16000 });
-    const source    = ctx.createMediaStreamSource(stream);
-    const processor = ctx.createScriptProcessor(2048, 1, 1);  // ~128ms chunks @ 16kHz (must be power of 2)
+  processor.onaudioprocess = e => {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    const f32 = e.inputBuffer.getChannelData(0);
+    const i16 = new Int16Array(f32.length);
+    for (let i = 0; i < f32.length; i++)
+      i16[i] = Math.max(-32768, Math.min(32767, f32[i] * 32768));
+    ws.send(i16.buffer);
+  };
 
-    processor.onaudioprocess = (e) => {
-      if (ws.readyState !== WebSocket.OPEN) return;
-      const f32 = e.inputBuffer.getChannelData(0);
-      const i16 = new Int16Array(f32.length);
-      for (let i = 0; i < f32.length; i++)
-        i16[i] = Math.max(-32768, Math.min(32767, f32[i] * 32768));
-      ws.send(i16.buffer);
-    };
-
-    source.connect(processor);
-    processor.connect(ctx.destination);
-
-    // Store for cleanup
-    mediaRecorder = { ctx, processor, stream };
-
-  } catch(e) {
-    addMsg("Mic error: " + e.message, "system");
-  }
+  source.connect(processor);
+  processor.connect(ctx.destination);
+  mediaRecorder = { ctx, processor, stream };
 }
 
 async function startChat() {
-  startBtn.style.display  = "none";
-  statusBar.style.display = "block";
-  setStatus("⏳ Starting...");
-
-  // Start mic first — browser needs user gesture to get mic access
+  startBtn.style.display = "none";
+  stopBtn.style.display  = "block";   // show STOP
   await startMic();
 
-  if (ws.readyState === WebSocket.OPEN) {
+  if (ws.readyState === WebSocket.OPEN)
     ws.send("__start__");
-  } else {
-    // WS not ready yet — send once onopen fires
+  else
     pendingStart = true;
-  }
 }
 
+function stopChat() {
+  // stop audio playback
+  stopCurrentAudio();
+  showListening(false);
+
+  // stop microphone & audio context
+  if (mediaRecorder) {
+    mediaRecorder.stream.getTracks().forEach(t => t.stop());
+    mediaRecorder.ctx.close();
+    mediaRecorder = null;
+  }
+
+  // close websocket session
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.close();
+  }
+
+  // restore UI
+  startBtn.style.display = "block";
+  stopBtn.style.display  = "none";
+
+  addMsg("--- stopped ---", "system");
+
+  // reconnect WS for next start
+  connectWS();
+}
+
+// establish websocket immediately
 connectWS();
 </script>
 </body>
