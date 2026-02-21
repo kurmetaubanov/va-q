@@ -624,7 +624,11 @@ INDEX_HTML = """<!DOCTYPE html>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: Arial, sans-serif; background: #f0f2f5;
          display: flex; justify-content: center; padding: 40px 16px; }
-  .container { width: 100%; max-width: 480px; }
+  .container {
+    width: 100%;
+    max-width: 480px;
+    position: relative;
+  }
   h2 { text-align: center; margin-bottom: 20px; color: #222; }
   #chat { background: #fff; border: 1px solid #ddd; border-radius: 10px;
           padding: 16px; height: 380px; overflow-y: auto; margin-bottom: 20px; }
@@ -677,12 +681,13 @@ INDEX_HTML = """<!DOCTYPE html>
   #statusBar.listening { background: #f3e5f5; color: #6a1b9a; border-color: #ce93d8; }
 
   #listeningIndicator {
-    display: none;
+    visibility: hidden;      /* вместо display:none */
+    height: 18px;            /* резервируем место → ничего не прыгает */
     color: #28a745;
     font-size: 13px;
-    margin: 12px 0 16px 0;   /* ↑ больше воздуха сверху и снизу */
+    margin: 6px 0 10px 0;    /* аккуратный отступ под чатом */
     animation: blink 1s step-start infinite;
-  }
+    }
 
   @keyframes blink { 50% { opacity: 0; } }
 </style>
@@ -728,7 +733,8 @@ function addMsg(text, cls) {
 }
 
 function showListening(on) {
-  document.getElementById("listeningIndicator").style.display = on ? "block" : "none";
+  document.getElementById("listeningIndicator").style.visibility =
+    on ? "visible" : "hidden";
 }
 
 function stopCurrentAudio() {
