@@ -1,4 +1,4 @@
-# Voice Scheduling Agent (Deployed)
+# Voice Scheduling Agent
 
 A real-time voice assistant that collects scheduling details, confirms them, and creates a calendar event file.
 
