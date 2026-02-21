@@ -621,6 +621,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Voice Scheduling Agent</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
