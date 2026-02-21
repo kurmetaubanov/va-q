@@ -8,11 +8,13 @@ A real-time voice assistant that collects scheduling details, confirms them, and
    - https://renewed-causal-phoenix.ngrok-free.app/
 2. Click the **START** button to initiate the assistant.
 3. The assistant will begin speaking. Wait until the **Tap to record** button appears, which indicates it is ready to listen.
-4. Tap **Tap to record** and speak your request (scheduling-related or unrelated).
-5. After speaking, tap **Stop recording** and wait for the assistant’s reply.
-6. Continue until all scheduling details are collected and confirmed.
-7. After final confirmation, the assistant provides an `.ics` file to download.
-8. Import the downloaded file into your preferred calendar app (Google Calendar, Outlook, Mozilla Thunderbird, Apple Calendar, etc.).
+4. **Always** tap **Tap to record** before you speak. If you do not tap record, the assistant will not listen.
+5. Speak your request (scheduling-related or unrelated).
+6. **Always** tap **Stop recording** immediately after you finish speaking. If you do not stop recording, the assistant will not process your message correctly.
+7. Wait for the assistant’s reply, then repeat the same cycle for each new turn: **Tap to record** → speak → **Stop recording**.
+8. Continue until all scheduling details are collected and confirmed.
+9. After final confirmation, the assistant provides an `.ics` file to download.
+10. Import the downloaded file into your preferred calendar app (Google Calendar, Outlook, Mozilla Thunderbird, Apple Calendar, etc.).
 
 ## What this agent does
 
