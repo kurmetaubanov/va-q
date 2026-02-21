@@ -6,6 +6,16 @@ A real-time voice assistant that collects scheduling details, confirms them, and
 
 **Live agent:** https://renewed-causal-phoenix.ngrok-free.app/
 
+1. Open the deployed URL in a browser:
+   - https://renewed-causal-phoenix.ngrok-free.app/
+2. Click the **START** button to initiate the assistant.
+3. The assistant will begin speaking. Wait until the **Tap to record** button appears, which indicates it is ready to listen.
+4. Tap **Tap to record** and speak your request (scheduling-related or unrelated).
+5. After speaking, tap **Stop recording** and wait for the assistant’s reply.
+6. Continue until all scheduling details are collected and confirmed.
+7. After final confirmation, the assistant provides an `.ics` file to download.
+8. Import the downloaded file into your preferred calendar app (Google Calendar, Outlook, Mozilla Thunderbird, Apple Calendar, etc.).
+
 ## What this agent does
 
 This assistant is intentionally focused, strict, and task-oriented.
@@ -34,25 +44,6 @@ To keep scheduling reliable, the agent follows strict rules:
 
 4. **Functional communication style.**  
    The assistant keeps responses concise, professional, and low-emotion so the flow remains efficient and predictable.
-
-## How to test the deployed assistant
-
-1. Open the deployed URL in a browser:
-   - https://renewed-causal-phoenix.ngrok-free.app/
-2. Click the **START** button to initiate the assistant.
-3. The assistant will begin speaking. Wait until the **Tap to record** button appears, which indicates it is ready to listen.
-4. Tap **Tap to record** and speak your request (scheduling-related or unrelated).
-5. After speaking, tap **Stop recording** and wait for the assistant’s reply.
-6. Continue until all scheduling details are collected and confirmed.
-7. After final confirmation, the assistant provides an `.ics` file to download.
-8. Import the downloaded file into your preferred calendar app (Google Calendar, Outlook, Mozilla Thunderbird, Apple Calendar, etc.).
-
-### Expected behavior during testing
-
-- If you provide a past date/time, the assistant asks for a new future slot.
-- If you ask unrelated questions, the assistant refuses that branch and returns to scheduling.
-- If you provide multiple/ambiguous time options or ask for recurring scheduling, the assistant asks you to choose one specific slot.
-- After confirmation, a calendar event file is generated.
 
 ## Run locally (optional)
 
@@ -101,7 +92,3 @@ Because `.ics` is a universal calendar format, users can import the generated ev
 ## Logs / evidence of event creation
 
 During runtime, server logs print scheduling tool activity and state updates (including finalized schedule and datetime extraction). This can be used as evidence that event creation flow was executed.
-
-If needed for submission, you can additionally attach:
-- a screenshot of the generated `.ics` download, or
-- a short Loom showing the full voice flow and event import.
