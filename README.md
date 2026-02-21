@@ -2,6 +2,25 @@
 
 A real-time voice assistant that collects scheduling details, confirms them, and creates a calendar event file.
 
+## Interface preview
+
+<table>
+  <tr>
+    <td align="center">
+      <img src="images/first.png" width="260"><br>
+      <sub>Initial screen</sub>
+    </td>
+    <td align="center">
+      <img src="images/started.png" width="260"><br>
+      <sub>After pressing START</sub>
+    </td>
+    <td align="center">
+      <img src="images/finished.png" width="260"><br>
+      <sub>Session completed</sub>
+    </td>
+  </tr>
+</table>
+
 ## Deployed URL
 
 1. Open the deployed URL in a browser:
