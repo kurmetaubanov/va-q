@@ -47,6 +47,63 @@ DEEPGRAM_FLUX_URL = (
 )
 
 # ─────────────────────────────────────────────────────────────
+# Datetime parser (dedicated Groq mini call — llama-3.1-8b-instant)
+# Handles all natural language forms: "half past five", "next Monday noon", etc.
+# temperature=0.0 → deterministic output, json_object mode → safe parsing
+# ─────────────────────────────────────────────────────────────
+
+def parse_datetime_groq(
+    date_str: str | None,
+    time_str: str | None,
+    reference: datetime | None = None,
+) -> str | None:
+    """
+    Dedicated nano-LLM call strictly for datetime parsing.
+    Separate from the main dialogue model — keeps concerns isolated.
+    Returns ISO 8601 string or None.
+    """
+    now = reference or datetime.now()
+    raw = " ".join(filter(None, [date_str, time_str])).strip()
+    if not raw:
+        return None
+
+    print(f"[DATETIME_PARSE] raw='{raw}'")
+
+    prompt = f"""Today is {now.strftime('%A, %Y-%m-%d %H:%M')}.
+
+Convert the following date/time expression to ISO 8601 format (YYYY-MM-DDTHH:MM:SS).
+Always resolve to the nearest FUTURE datetime.
+If the user says a weekday (e.g. "Monday"), pick the next upcoming occurrence.
+"half past X" means X:30. "quarter past X" means X:15. "noon" means 12:00. "midnight" means 00:00.
+
+Date input: {date_str or 'not specified'}
+Time input: {time_str or 'not specified'}
+
+Respond ONLY with a JSON object, no explanation:
+{{"iso": "YYYY-MM-DDTHH:MM:SS", "confidence": "high|medium|low"}}
+
+If you cannot determine a valid future datetime, respond:
+{{"iso": null, "confidence": "low"}}"""
+
+    try:
+        r = groq_client.chat.completions.create(
+            model=MODEL,  # same as main dialogue — reliable datetime resolution
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=64,
+            response_format={"type": "json_object"},
+        )
+        data = json.loads(r.choices[0].message.content)
+        iso = data.get("iso")
+        confidence = data.get("confidence", "?")
+        print(f"[DATETIME_PARSE] → {iso} (confidence={confidence})")
+        return iso
+    except Exception as e:
+        print(f"[DATETIME_PARSE ERROR] {e}")
+        return None
+
+
+# ─────────────────────────────────────────────────────────────
 # Scheduling state
 # ─────────────────────────────────────────────────────────────
 
@@ -71,7 +128,7 @@ def is_finalized(state: dict) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────
-# Groq tools (unchanged from va-q)
+# Groq tools
 # ─────────────────────────────────────────────────────────────
 
 TOOLS = [
@@ -138,7 +195,10 @@ TOOLS = [
             "name": "update_schedule",
             "description": (
                 "Extract and update scheduling information from the conversation. "
-                "Call this tool on every user message to keep state up to date."
+                "Call this tool on every user message to keep state up to date. "
+                "Do NOT compute iso_datetime — it is handled externally. "
+                "Focus only on extracting: user_name, date (human readable), time (human readable), "
+                "title, and schedule_finalized flag."
             ),
             "parameters": {
                 "type": "object",
@@ -149,11 +209,11 @@ TOOLS = [
                     },
                     "date": {
                         "anyOf": [{"type": "string"}, {"type": "null"}],
-                        "description": "Single specific date. Null if multiple or ambiguous."
+                        "description": "Single specific date as the user said it (e.g. 'next Monday', 'March 5'). Null if multiple or ambiguous."
                     },
                     "time": {
                         "anyOf": [{"type": "string"}, {"type": "null"}],
-                        "description": "Single specific time. Null if multiple or ambiguous."
+                        "description": "Single specific time as the user said it (e.g. 'half past three', '9am'). Null if multiple or ambiguous."
                     },
                     "title": {
                         "anyOf": [{"type": "string"}, {"type": "null"}],
@@ -165,15 +225,6 @@ TOOLS = [
                             "Set to true ONLY when user_name, date, and time are all known "
                             "AND the user has explicitly confirmed the booking."
                         )
-                    },
-                    "iso_datetime": {
-                        "anyOf": [{"type": "string"}, {"type": "null"}],
-                        "description": (
-                            "ISO 8601 datetime string (local time) e.g. '2026-02-27T17:00:00'. "
-                            "You MUST compute and return this value whenever date and time are known. "
-                            "If the user says a weekday (e.g. Monday), resolve it to the nearest future date. "
-                            "schedule_finalized MUST NEVER be true if iso_datetime is null."
-                        )
                     }
                 },
                 "required": ["schedule_finalized"]
@@ -181,6 +232,8 @@ TOOLS = [
         }
     }
 ]
+
+# Note: iso_datetime is removed from the LLM tool — it's now computed deterministically
 
 
 # ─────────────────────────────────────────────────────────────
@@ -278,6 +331,7 @@ def groq_dialogue(history: list, state: dict, user_msg: str) -> tuple[str, dict,
     secondary_intent = None
     iso_datetime = None
     past_datetime = None
+    date_updated = False
 
     if message.tool_calls:
         for tc in message.tool_calls:
@@ -291,9 +345,19 @@ def groq_dialogue(history: list, state: dict, user_msg: str) -> tuple[str, dict,
                 new_state = merge_state(state, args)
                 print(f"[TOOL] update_schedule: {args}")
                 print(f"[STATE] {new_state}")
-                if args.get("iso_datetime"):
-                    iso_datetime = args["iso_datetime"]
-                    print(f"[TOOL] iso_datetime: {iso_datetime}")
+
+                # Deterministic datetime parsing — triggered when date or time changed
+                if args.get("date") or args.get("time"):
+                    date_updated = True
+                    resolved = parse_datetime_groq(
+                        new_state.get("date"),
+                        new_state.get("time"),
+                    )
+                    if resolved:
+                        iso_datetime = resolved
+                        print(f"[DATETIME] resolved iso_datetime: {iso_datetime}")
+                    else:
+                        print("[DATETIME] could not resolve iso_datetime")
 
             elif name == "validate_datetime":
                 print(f"[TOOL] validate_datetime: {args}")
@@ -519,8 +583,6 @@ async def ws_endpoint(websocket: WebSocket):
                 print(f"[FLUX ERROR] {e} — retry 1s")
                 await asyncio.sleep(1)
 
-    # ── LLM processor ────────────────────────────────────────
-
     async def transcript_processor():
         """Consumes EndOfTurn transcripts → Groq → ElevenLabs → browser."""
         while True:
@@ -546,6 +608,7 @@ async def ws_endpoint(websocket: WebSocket):
 
             print(f"[LLM] reply: '{reply}'")
 
+            # Keep iso_datetime if newly resolved; don't overwrite with None
             if iso_dt:
                 session["iso_datetime"] = iso_dt
 
@@ -610,7 +673,7 @@ async def ws_endpoint(websocket: WebSocket):
     finally:
         dg_task.cancel()
         llm_task.cancel()
-        await audio_q.put(None)  # unblock sender
+        await audio_q.put(None)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -640,7 +703,6 @@ INDEX_HTML = """<!DOCTYPE html>
   .agent   { color: #0b5cff; margin: 6px 0; }
   .system  { color: #999; font-size: 12px; margin: 4px 0; }
 
-  /* START button */
   #startBtn {
     display: block;
     width: 100%;
@@ -654,7 +716,6 @@ INDEX_HTML = """<!DOCTYPE html>
     margin-bottom: 10px;
   }
 
-  /* STOP button */
   #stopBtn {
     display: none;
     width: 100%;
@@ -684,11 +745,11 @@ INDEX_HTML = """<!DOCTYPE html>
   #statusBar.listening { background: #f3e5f5; color: #6a1b9a; border-color: #ce93d8; }
 
   #listeningIndicator {
-    visibility: hidden;      /* вместо display:none */
-    height: 18px;            /* резервируем место → ничего не прыгает */
+    visibility: hidden;
+    height: 18px;
     color: #28a745;
     font-size: 13px;
-    margin: 6px 0 10px 0;    /* аккуратный отступ под чатом */
+    margin: 6px 0 10px 0;
     animation: blink 1s step-start infinite;
     }
 
@@ -703,10 +764,7 @@ INDEX_HTML = """<!DOCTYPE html>
 
   <div id="listeningIndicator">🟢 Listening...</div>
 
-  <!-- START button -->
   <button id="startBtn" onclick="startChat()">START</button>
-
-  <!-- STOP button (appears during active session) -->
   <button id="stopBtn" onclick="stopChat()">STOP</button>
 
   <div id="statusBar">🎙 Listening...</div>
@@ -809,11 +867,6 @@ function connectWS() {
     }
 
     if (data === "__show_start__") {
-
-      // stop audio playback immediately
-      // stopCurrentAudio();
-
-      // STOP microphone streaming immediately
       if (mediaRecorder) {
           mediaRecorder.stream.getTracks().forEach(t => t.stop());
           mediaRecorder.ctx.close();
@@ -824,7 +877,7 @@ function connectWS() {
 
       startBtn.style.display = "block";
       stopBtn.style.display  = "none";
-   
+
       addMsg("--- session complete ---", "system");
 
       return;
@@ -861,7 +914,7 @@ async function startMic() {
 
 async function startChat() {
   startBtn.style.display = "none";
-  stopBtn.style.display  = "block";   // show STOP
+  stopBtn.style.display  = "block";
   await startMic();
 
   if (ws.readyState === WebSocket.OPEN)
@@ -871,33 +924,27 @@ async function startChat() {
 }
 
 function stopChat() {
-  // stop audio playback
   stopCurrentAudio();
   showListening(false);
 
-  // stop microphone & audio context
   if (mediaRecorder) {
     mediaRecorder.stream.getTracks().forEach(t => t.stop());
     mediaRecorder.ctx.close();
     mediaRecorder = null;
   }
 
-  // close websocket session
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.close();
   }
 
-  // restore UI
   startBtn.style.display = "block";
   stopBtn.style.display  = "none";
 
   addMsg("--- stopped ---", "system");
 
-  // reconnect WS for next start
   connectWS();
 }
 
-// establish websocket immediately
 connectWS();
 </script>
 </body>
