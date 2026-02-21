@@ -4,7 +4,7 @@ A real-time voice assistant that collects scheduling details, confirms them, and
 
 ## Deployed URL
 
-1. Open the deployed **Live agent** URL in a browser:
+1. Open the deployed URL in a browser:
    - https://renewed-causal-phoenix.ngrok-free.app/
 2. Click the **START** button to initiate the assistant.
 3. The assistant will begin speaking. Wait until the **Tap to record** button appears, which indicates it is ready to listen.
